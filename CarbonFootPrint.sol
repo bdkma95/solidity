@@ -1,129 +1,41 @@
 // SPDX-License-Identifier: MIT
+pragma solidity ^0.8.14;
 
-pragma solidity ^0.8.15;
+contract CarbonFootprint {
 
-contract CarbonFootPrint {
-    // Structures - Entities Implementation
-    struct Product {
+    struct Company {
         uint32 id;
-        string name;
-        string description;
-        bool intermediate;
-        uint32 idOrganization;
-        uint32 idUnit;
-        uint32 [] productFootPrints;
+        string CompanyName;
+        uint32 trucks;
+        uint32 avgdistance;
+        uint32 trucksweigth;
+        uint32 cargoweight;
     }
+    
+    enum TruckType {CTT, ALMA}
 
-    struct ProductFootPrint {
-        uint32 id;
-        uint32 co2eq;
-        uint16 exp;
-        uint32 idProduct;
-        uint32 year;
-        string month;
-        uint32 idMonthlyActivity;
-    }
+    TruckType choice;
 
-    struct MonthlyActivity {
-        uint32 id;
-        string description;
-        uint32 co2eq;
-        uint16 exp;
-        string month;
-        uint32 [] productQuantities;
-        uint32 output;
-        uint32 finalProductQuantity;
-        uint32 idOrganization;
-        uint32 idUnit;
-        uint32 idYear;
-        address idUser;
-        uint32 [] productionCosts;
-    }
+    uint16 CLCV = 143;
+    uint16 CHCV = 307;
 
-    mapping(uint32 => Product) public products;
-    uint32 public productsCount;
+    Company[] private companies;
 
-    mapping(uint32 => MonthlyActivity) public mActivity;
-    uint32 public mActivityCount;
+    function cfpcalculator(uint32 trucks_weigth, uint32 cargo_weight, uint32 avg_distance, uint32 no_of_trucks) external view returns(uint256) {
 
-    mapping(uint32 => Organization) public organizations;
-    uint32 public organizationsCount;
+        uint256 total_weigth = trucks_weigth + cargo_weight;
+        uint256 tonkm = total_weigth * avg_distance * no_of_trucks;
 
-    mapping(uint32 => MonthlyFixCost) public mFixCostsCount;
-    uint32 public monthlyFixCostsCount;
+        uint256 cfpvalues;
 
-    mapping(uint32 => Unit) public units;
-    uint32 public unitsCount;
-
-    mapping(uint32 => ProductCost) public productsCosts;
-    uint32 public productCostsCount;
-
-    mapping(uint32 => CostType) public costsTypes;
-    uint32 public costsTypesCount;
-
-    mapping(uint32 => ProductFootPrint) public productFootPrints;
-    uint32 public pFootPrintCount;
-
-    mapping(uint32 => ProductQuantity) public productsQuantities;
-    uint32 public productsQuantitiesCount;
-
-    event registerUserEvent(address indexed _candidatesAddress);
-
-    constructor() {
-        users[msg.sender] = User(msg.sender, 0, true);
-        arrayUsers.push(msg.sender);
-
-        // Initializa units
-        addUnit("tonne", "t", 10, 0, 1, false);
-        addUnit("kilogram", "kg", 10, 3, 1, true);
-        addUnit("gram", "g", 10, 6, 1, true);
-        addUnit("miligram", "mg", 10, 9, 1, true);
-    }
-
-    function addUser(address _userResp, address _user, uint16 _tipo, uint32 _organization) public {
-        require(users[_user].user_add == address(0), "User already registered");
-        if(_tipo == 0 || _tipo == 1) {
-            require(users[_userResp].tipo == 0, "You need admin permissions");
-        }else if(_tipo == 2) {
-            require(users[_userResp].tipo == 1, "You need organization admin permissions");
+        if (choice == TruckType.CTT)
+        {
+            cfpvalues = CLCV * tonkm;
+            return cfpvalues / 1000000;
         }
-
-        users[_user] = User(_user, _tipo, true);
-        arrayUsers.push(_user);
-        userOrganizations[_user].push(_organization);
-
-        emit registerUserEvent(_user);
-    }
-
-    // Add New Product Function
-    function addProduct(string memory _name, string memory _description, bool _intermediate, uint32 _org, uint32 _unit, uint32 [] memory _footPrints) public {
-        bool exist = false;
-        require(users[msg.sender].idOrganization == _org, "You need to belong to the organization");
-        require(organizations[_org].id!= uint32(0), "Organization doesn't exist");
-
-        for(uint32 i=1; i <= productsCount; i++) {
-            string memory name = products[i].name;
-            if(keccak256(abi.encodePacked(_name))) {
-                exist = true;
-            }
+        else {
+            cfpvalues = CHCV * tonkm;
+            return cfpvalues / 1000000;
         }
-
-        require(!exist, "Product already registered");
-
-        productsCount++;
-        products[productsCount] =
-            Product(productsCount, _name, _description, units[_unit].initials, _intermediate, _org, _unit, _footPrints);
-        organizations[_org].products.push(productsCount);
-    }
-
-    // Add New Product Footprint Function
-    function addFootPrintProd(uint32 _co2eq, uint16 _exp, uint32 _idProd, uint32 _year, string memory _month, uint32 _idMa) public {
-        require(users[msg.sender].idOrganization == products[_idProd].idOrganization, "The product doesn't belong to your organization");
-        require(products[_idProd].id != uint32(0), "Product doesn't exist");
-
-        pFootPrintCount++;
-        productFootPrints[pFootPrintCount] = 
-            ProductFootPrint(pFootPrintCount, _co2eq, _exp, idProd, _year, _month, _idMa);
-        products[_idProd].productFootPrints.push(pFootPrintCount);
     }
 }
