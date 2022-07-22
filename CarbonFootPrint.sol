@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.14;
+pragma solidity ^0.8.15;
 
 contract CarbonFootprint {
 
@@ -16,8 +16,8 @@ contract CarbonFootprint {
 
     TruckType choice;
 
-    uint16 CLCV = 143;
-    uint16 CHCV = 307;
+    uint16 CLCV = 246;
+    uint16 CHCV = 602;
 
     Company[] private companies;
 
