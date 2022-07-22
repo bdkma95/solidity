@@ -69,7 +69,7 @@ contract CarbonFootPrint {
 
     event registerUserEvent(address indexed _candidatesAddress);
 
-    constructor() public {
+    constructor() {
         users[msg.sender] = User(msg.sender, 0, true);
         arrayUsers.push(msg.sender);
 
