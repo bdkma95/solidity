@@ -3,8 +3,18 @@ pragma solidity >=0.7.0 <0.9.0;
 
 interface IERC20 {
     function transfer(address recipient, uint256 amount) external returns (bool);
-    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+}
+
+interface IChainlinkPriceFeed {
+    function latestRoundData() external view returns (
+        uint80 roundId, 
+        int256 answer, 
+        uint256 startedAt, 
+        uint256 updatedAt, 
+        uint80 answeredInRound
+    );
 }
 
 contract SwappingContract {
@@ -15,6 +25,9 @@ contract SwappingContract {
     address public feeRecipient; // Address to receive the fees
 
     uint256 public maxSwapAmount; // Maximum allowed Ether to swap in one transaction
+
+    IChainlinkPriceFeed public priceFeed; // Chainlink price feed for dynamic slippage
+    uint256 public slippageThreshold; // Max slippage percentage allowed (in basis points, e.g., 500 = 5%)
 
     bool private locked;
 
@@ -37,29 +50,41 @@ contract SwappingContract {
         locked = false;
     }
 
-    constructor(address _tokenAddress, uint256 _rate, uint256 _maxSwapAmount, uint256 _feePercent, address _feeRecipient) {
+    constructor(address _tokenAddress, uint256 _rate, uint256 _maxSwapAmount, uint256 _feePercent, address _feeRecipient, address _priceFeedAddress) {
         owner = msg.sender;
         token = IERC20(_tokenAddress);
         rate = _rate;
         maxSwapAmount = _maxSwapAmount;
         feePercent = _feePercent;
         feeRecipient = _feeRecipient;
+        priceFeed = IChainlinkPriceFeed(_priceFeedAddress);
+        slippageThreshold = 500; // Default 5% slippage tolerance
     }
 
-    // Function to exchange Ether for tokens with fee and slippage protection
+    // Fetch the latest price from Chainlink
+    function getLatestPrice() public view returns (uint256) {
+        (, int256 price, , , ) = priceFeed.latestRoundData();
+        require(price > 0, "Invalid price feed response");
+        return uint256(price);
+    }
+
+    // Function to exchange Ether for tokens with fee and dynamic slippage protection
     function swapEtherToToken(uint256 slippage) external payable noReentrancy returns (uint256) {
         require(msg.value > 0, "Must send Ether to swap");
         require(msg.value <= maxSwapAmount, "Swap exceeds maximum limit");
 
         uint256 tokenAmount = msg.value * rate; // Calculate the number of tokens to send
 
-        // Calculate the fee amount and adjust the tokenAmount
+        // Fetch current price and calculate dynamic slippage
+        uint256 currentPrice = getLatestPrice();
+        uint256 slippageAmount = (tokenAmount * slippage) / 10000;
+        uint256 minAmountToReceive = tokenAmount - slippageAmount;
+
+        // If the slippage exceeds the threshold, revert
+        require(tokenAmount >= minAmountToReceive, "Slippage too high");
+
         uint256 feeAmount = (tokenAmount * feePercent) / 10000;
         uint256 amountToTransfer = tokenAmount - feeAmount;
-
-        // Calculate slippage tolerance
-        uint256 minAmountToReceive = (amountToTransfer * (10000 - slippage)) / 10000;
-        require(amountToTransfer >= minAmountToReceive, "Slippage too high");
 
         uint256 contractTokenBalance = token.balanceOf(address(this));
         require(contractTokenBalance >= amountToTransfer, "Not enough tokens in the contract");
@@ -129,6 +154,11 @@ contract SwappingContract {
     function setFeeRecipient(address _feeRecipient) external onlyOwner {
         feeRecipient = _feeRecipient;
         emit FeeRecipientUpdated(_feeRecipient);
+    }
+
+    // Function to update the slippage threshold
+    function setSlippageThreshold(uint256 _slippageThreshold) external onlyOwner {
+        slippageThreshold = _slippageThreshold;
     }
 
     // Function to recover tokens accidentally sent to the contract
