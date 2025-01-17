@@ -12,16 +12,17 @@ contract SwappingContract {
     IERC20 public token; // ERC20 token contract
     uint256 public rate; // The exchange rate (number of tokens per Ether)
     uint256 public feePercent; // Fee percentage for the swap (in basis points, e.g., 100 = 1%)
+    address public feeRecipient; // Address to receive the fees
 
     uint256 public maxSwapAmount; // Maximum allowed Ether to swap in one transaction
 
-    // Reentrancy guard modifier
     bool private locked;
 
     event Swap(address indexed user, uint256 etherAmount, uint256 tokenAmount, uint256 feeAmount);
     event WithdrawEther(address indexed owner, uint256 amount);
     event RateUpdated(uint256 newRate);
     event FeeUpdated(uint256 newFeePercent);
+    event FeeRecipientUpdated(address newFeeRecipient);
     event TokensRecovered(address indexed token, uint256 amount);
 
     modifier onlyOwner() {
@@ -36,12 +37,13 @@ contract SwappingContract {
         locked = false;
     }
 
-    constructor(address _tokenAddress, uint256 _rate, uint256 _maxSwapAmount, uint256 _feePercent) {
+    constructor(address _tokenAddress, uint256 _rate, uint256 _maxSwapAmount, uint256 _feePercent, address _feeRecipient) {
         owner = msg.sender;
         token = IERC20(_tokenAddress);
         rate = _rate;
         maxSwapAmount = _maxSwapAmount;
         feePercent = _feePercent;
+        feeRecipient = _feeRecipient;
     }
 
     // Function to exchange Ether for tokens with fee and slippage protection
@@ -64,6 +66,11 @@ contract SwappingContract {
 
         // Transfer the tokens to the user
         token.transfer(msg.sender, amountToTransfer);
+
+        // Transfer the fee to the feeRecipient
+        if (feeAmount > 0) {
+            token.transfer(feeRecipient, feeAmount);
+        }
 
         emit Swap(msg.sender, msg.value, amountToTransfer, feeAmount);
         return amountToTransfer;
@@ -116,6 +123,12 @@ contract SwappingContract {
     function setFeePercent(uint256 _feePercent) external onlyOwner {
         feePercent = _feePercent;
         emit FeeUpdated(_feePercent);
+    }
+
+    // Function to set the fee recipient address
+    function setFeeRecipient(address _feeRecipient) external onlyOwner {
+        feeRecipient = _feeRecipient;
+        emit FeeRecipientUpdated(_feeRecipient);
     }
 
     // Function to recover tokens accidentally sent to the contract
