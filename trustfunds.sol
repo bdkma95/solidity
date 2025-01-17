@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.3;
+pragma solidity ^0.8.9;
 
 contract Trustfunds {
     struct Child {
@@ -10,6 +10,11 @@ contract Trustfunds {
 
     mapping(address => Child) public children; // Mapping of child address to their Trustfund details
     address public admin; // Address of the admin (who can add children)
+
+    // Declare events for tracking
+    event ChildAdded(address indexed child, uint amount, uint majority);
+    event Withdrawn(address indexed child, uint amount);
+    event Deposit(address indexed admin, uint amount);
 
     // Only admin can add a child
     modifier onlyAdmin() {
@@ -32,6 +37,12 @@ contract Trustfunds {
             majority: block.timestamp + timetomajority, 
             paid: false
         });
+
+        // Emit event for adding a child
+        emit ChildAdded(child, msg.value, block.timestamp + timetomajority);
+
+        // Emit event for the deposit from the admin
+        emit Deposit(msg.sender, msg.value);
     }
 
     // Function to allow the child to withdraw the funds once they reach majority
@@ -47,7 +58,12 @@ contract Trustfunds {
         child.paid = true;
 
         // Transfer the funds to the child
-        payable(msg.sender).transfer(child.amount);
+        uint amount = child.amount;
+        child.amount = 0; // Reset amount before transferring to prevent reentrancy attacks
+        payable(msg.sender).transfer(amount);
+
+        // Emit event for withdrawal
+        emit Withdrawn(msg.sender, amount);
     }
 
     // Function to check the trust fund details of a child
