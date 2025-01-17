@@ -8,14 +8,16 @@ contract Escrow {
     address public buyer;
     address payable public seller;
     uint256 public paymentAmount;
-    uint256 public escrowFeePercentage = 1; // Fee percentage (1%)
+    uint256 public escrowFeePercentageBuyer = 1; // Default fee for buyers (1%)
+    uint256 public escrowFeePercentageSeller = 1; // Default fee for sellers (1%)
     mapping(address => uint256) public deposits;
 
     // Declare events for better transparency
-    event Deposited(address indexed buyer, uint256 amount);
-    event Withdrawn(address indexed seller, uint256 amount);
+    event Deposited(address indexed buyer, uint256 amount, uint256 fee);
+    event Withdrawn(address indexed seller, uint256 amount, uint256 fee);
     event DeliveryConfirmed(address indexed buyer);
     event FeeDeducted(address indexed payer, uint256 feeAmount);
+    event FeeUpdated(string role, uint256 newFee);
 
     // Modifiers
     modifier onlyBuyer() {
@@ -40,24 +42,37 @@ contract Escrow {
         currState = State.AWAITING_PAYMENT;
     }
 
+    // Function to set fee rates for buyers and sellers
+    function setFeePercentage(uint256 newFeeBuyer, uint256 newFeeSeller) external {
+        // Ensure the new fee is within an acceptable range (e.g., 0 to 5%)
+        require(newFeeBuyer <= 5, "Fee for buyer cannot exceed 5%");
+        require(newFeeSeller <= 5, "Fee for seller cannot exceed 5%");
+        
+        escrowFeePercentageBuyer = newFeeBuyer;
+        escrowFeePercentageSeller = newFeeSeller;
+
+        emit FeeUpdated("Buyer", newFeeBuyer);
+        emit FeeUpdated("Seller", newFeeSeller);
+    }
+
     // Function for the buyer to deposit funds to escrow
     function deposit() external onlyBuyer payable inState(State.AWAITING_PAYMENT) {
         uint256 amount = msg.value;
         require(amount > 0, "Deposit amount must be greater than 0");
 
-        // Deduct fee
-        uint256 fee = (amount * escrowFeePercentage) / 100;
-        uint256 amountAfterFee = amount - fee;
+        // Deduct fee for the buyer
+        uint256 feeBuyer = (amount * escrowFeePercentageBuyer) / 100;
+        uint256 amountAfterFee = amount - feeBuyer;
 
         deposits[seller] += amountAfterFee;
         paymentAmount += amountAfterFee;
 
-        // Send the fee to the contract owner (assuming contract deployer is the fee recipient)
-        address payable owner = address(uint160(msg.sender)); // Could be a dedicated fee recipient address
-        owner.transfer(fee);
+        // Send the fee to the contract owner (or fee recipient address)
+        address payable owner = address(uint160(msg.sender)); // Could be a platform address
+        owner.transfer(feeBuyer);
 
-        emit FeeDeducted(msg.sender, fee);
-        emit Deposited(buyer, amountAfterFee);
+        emit FeeDeducted(msg.sender, feeBuyer);
+        emit Deposited(buyer, amountAfterFee, feeBuyer);
     }
 
     // Function to allow the seller to withdraw the funds after confirmation
@@ -65,12 +80,21 @@ contract Escrow {
         uint256 payment = deposits[seller];
         require(payment > 0, "No funds to withdraw");
 
+        // Deduct fee for the seller
+        uint256 feeSeller = (payment * escrowFeePercentageSeller) / 100;
+        uint256 amountAfterFee = payment - feeSeller;
+
         deposits[seller] = 0;  // Reset the deposit to prevent re-entrancy
-        seller.transfer(payment);
+        seller.transfer(amountAfterFee);
+
+        // Send the fee to the contract owner (or fee recipient address)
+        address payable owner = address(uint160(msg.sender)); // Could be a platform address
+        owner.transfer(feeSeller);
 
         currState = State.AWAITING_DELIVERY;
 
-        emit Withdrawn(seller, payment);
+        emit FeeDeducted(seller, feeSeller);
+        emit Withdrawn(seller, amountAfterFee, feeSeller);
     }
 
     // Function for the buyer to confirm the delivery of the goods or service
@@ -83,15 +107,8 @@ contract Escrow {
         emit DeliveryConfirmed(buyer);
     }
 
-    // Function to check if the contract is in a specific state
+    // Function to get the current state
     function getState() external view returns (State) {
         return currState;
-    }
-
-    // Function to update the fee percentage (only the contract deployer can change it)
-    function setFeePercentage(uint256 newFee) external {
-        // Ensure the new fee is within an acceptable range (e.g., 0 to 5%)
-        require(newFee <= 5, "Fee cannot exceed 5%");
-        escrowFeePercentage = newFee;
     }
 }
