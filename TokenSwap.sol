@@ -12,6 +12,8 @@ contract TokenSwap {
     address public owner;
     mapping(address => mapping(address => uint256)) public exchangeRates; // [tokenA][tokenB] => rate
     mapping(address => uint256) public userSwapCount; // Tracks how many swaps a user has made
+    mapping(address => mapping(address => uint256)) public liquidityPools; // [tokenA][tokenB] => liquidity
+    mapping(address => mapping(address => uint256)) public liquidityProviderShares; // [user][tokenA/tokenB] => share of pool
     uint256 public baseFeePercentage; // Base fee percentage
 
     modifier onlyOwner() {
@@ -21,6 +23,8 @@ contract TokenSwap {
 
     event ExchangeRateSet(address indexed tokenA, address indexed tokenB, uint256 rate);
     event TokensSwapped(address indexed user, address[] tokenSequence, uint256[] amountsIn, uint256[] amountsOut, uint256 fee);
+    event LiquidityAdded(address indexed provider, address indexed tokenA, address indexed tokenB, uint256 amountA, uint256 amountB);
+    event LiquidityRemoved(address indexed provider, address indexed tokenA, address indexed tokenB, uint256 amountA, uint256 amountB);
 
     constructor() {
         owner = msg.sender;
@@ -40,7 +44,7 @@ contract TokenSwap {
         baseFeePercentage = newFeePercentage;
     }
 
-    // Calculate dynamic fee based on user swap count
+    // Calculate dynamic fee based on user swaps
     function getDynamicFee(address user) public view returns (uint256) {
         uint256 swaps = userSwapCount[user];
         // Example dynamic fee structure: reduce fee after 10 swaps
@@ -50,14 +54,58 @@ contract TokenSwap {
         return baseFeePercentage; // Default fee
     }
 
-    // Swap multiple tokens in sequence
+    // Add liquidity for a specific token pair
+    function addLiquidity(address tokenA, address tokenB, uint256 amountA, uint256 amountB) public {
+        require(amountA > 0 && amountB > 0, "Amounts must be greater than 0");
+
+        // Transfer tokens from user to the contract
+        IToken(tokenA).transferFrom(msg.sender, address(this), amountA);
+        IToken(tokenB).transferFrom(msg.sender, address(this), amountB);
+
+        // Update liquidity pools
+        liquidityPools[tokenA][tokenB] += amountA;
+        liquidityPools[tokenB][tokenA] += amountB;
+
+        // Track user's share of the liquidity pool
+        liquidityProviderShares[msg.sender][tokenA] += amountA;
+        liquidityProviderShares[msg.sender][tokenB] += amountB;
+
+        emit LiquidityAdded(msg.sender, tokenA, tokenB, amountA, amountB);
+    }
+
+    // Remove liquidity for a specific token pair
+    function removeLiquidity(address tokenA, address tokenB, uint256 amountA, uint256 amountB) public {
+        require(amountA > 0 && amountB > 0, "Amounts must be greater than 0");
+
+        uint256 userShareA = liquidityProviderShares[msg.sender][tokenA];
+        uint256 userShareB = liquidityProviderShares[msg.sender][tokenB];
+
+        // Ensure the user has enough liquidity to remove
+        require(userShareA >= amountA && userShareB >= amountB, "Not enough liquidity to remove");
+
+        // Update liquidity pools
+        liquidityPools[tokenA][tokenB] -= amountA;
+        liquidityPools[tokenB][tokenA] -= amountB;
+
+        // Update user's share
+        liquidityProviderShares[msg.sender][tokenA] -= amountA;
+        liquidityProviderShares[msg.sender][tokenB] -= amountB;
+
+        // Transfer the liquidity back to the user
+        IToken(tokenA).transfer(msg.sender, amountA);
+        IToken(tokenB).transfer(msg.sender, amountB);
+
+        emit LiquidityRemoved(msg.sender, tokenA, tokenB, amountA, amountB);
+    }
+
+    // Swap tokens (including multi-token swaps)
     function multiTokenSwap(address[] memory tokens, uint256[] memory amounts) public {
         require(tokens.length == amounts.length, "Token list and amount list length mismatch");
         require(tokens.length > 1, "At least 2 tokens are needed to perform a multi-token swap");
 
         uint256 totalFee;
         uint256[] memory amountsOut = new uint256[](tokens.length);
-        
+
         // Iterate through the token sequence and perform swaps
         for (uint256 i = 0; i < tokens.length - 1; i++) {
             address tokenA = tokens[i];
