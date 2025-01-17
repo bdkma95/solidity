@@ -14,21 +14,34 @@ contract TokenSwap {
     mapping(address => uint256) public userSwapCount; // Tracks how many swaps a user has made
     mapping(address => mapping(address => uint256)) public liquidityPools; // [tokenA][tokenB] => liquidity
     mapping(address => mapping(address => uint256)) public liquidityProviderShares; // [user][tokenA/tokenB] => share of pool
+    mapping(address => uint256) public poolTokens; // [user] => pool token balance
     uint256 public baseFeePercentage; // Base fee percentage
+    uint256 public totalLiquidity; // Total liquidity in the contract
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not the owner");
         _;
     }
 
+    modifier onlyGovernance() {
+        require(msg.sender == governanceContract, "Not authorized");
+        _;
+    }
+
+    address public governanceContract; // Address of the governance contract
+    uint256 public totalVotes; // Total number of votes cast
+
+    // Event declarations
     event ExchangeRateSet(address indexed tokenA, address indexed tokenB, uint256 rate);
+    event LiquidityAdded(address indexed provider, address indexed tokenA, address indexed tokenB, uint256 amountA, uint256 amountB, uint256 poolTokensReceived);
+    event LiquidityRemoved(address indexed provider, address indexed tokenA, address indexed tokenB, uint256 amountA, uint256 amountB, uint256 poolTokensBurned);
     event TokensSwapped(address indexed user, address[] tokenSequence, uint256[] amountsIn, uint256[] amountsOut, uint256 fee);
-    event LiquidityAdded(address indexed provider, address indexed tokenA, address indexed tokenB, uint256 amountA, uint256 amountB);
-    event LiquidityRemoved(address indexed provider, address indexed tokenA, address indexed tokenB, uint256 amountA, uint256 amountB);
+    event FeeModelUpdated(uint256 newFeePercentage);
 
     constructor() {
         owner = msg.sender;
         baseFeePercentage = 1; // Default fee of 1%
+        governanceContract = address(0); // Initially no governance contract
     }
 
     // Set the exchange rate between tokenA and tokenB
@@ -42,6 +55,12 @@ contract TokenSwap {
     function setBaseFeePercentage(uint256 newFeePercentage) public onlyOwner {
         require(newFeePercentage <= 100, "Fee percentage cannot exceed 100");
         baseFeePercentage = newFeePercentage;
+        emit FeeModelUpdated(newFeePercentage);
+    }
+
+    // Set the governance contract address
+    function setGovernanceContract(address _governanceContract) public onlyOwner {
+        governanceContract = _governanceContract;
     }
 
     // Calculate dynamic fee based on user swaps
@@ -66,91 +85,83 @@ contract TokenSwap {
         liquidityPools[tokenA][tokenB] += amountA;
         liquidityPools[tokenB][tokenA] += amountB;
 
-        // Track user's share of the liquidity pool
+        // Calculate the amount of pool tokens to issue based on the total liquidity
+        uint256 poolTokensIssued = amountA + amountB; // Simplified pool token issuance
+
+        // Track user's share of the pool
         liquidityProviderShares[msg.sender][tokenA] += amountA;
         liquidityProviderShares[msg.sender][tokenB] += amountB;
+        poolTokens[msg.sender] += poolTokensIssued;
 
-        emit LiquidityAdded(msg.sender, tokenA, tokenB, amountA, amountB);
+        // Update total liquidity in the pool
+        totalLiquidity += poolTokensIssued;
+
+        emit LiquidityAdded(msg.sender, tokenA, tokenB, amountA, amountB, poolTokensIssued);
     }
 
     // Remove liquidity for a specific token pair
-    function removeLiquidity(address tokenA, address tokenB, uint256 amountA, uint256 amountB) public {
-        require(amountA > 0 && amountB > 0, "Amounts must be greater than 0");
+    function removeLiquidity(address tokenA, address tokenB, uint256 poolTokenAmount) public {
+        require(poolTokenAmount > 0, "Pool tokens must be greater than 0");
 
-        uint256 userShareA = liquidityProviderShares[msg.sender][tokenA];
-        uint256 userShareB = liquidityProviderShares[msg.sender][tokenB];
+        // Ensure the user has enough pool tokens to remove liquidity
+        require(poolTokens[msg.sender] >= poolTokenAmount, "Insufficient pool token balance");
 
-        // Ensure the user has enough liquidity to remove
-        require(userShareA >= amountA && userShareB >= amountB, "Not enough liquidity to remove");
+        // Calculate the amount of tokens to remove based on the user's share of the liquidity pool
+        uint256 amountA = (liquidityPools[tokenA][tokenB] * poolTokenAmount) / totalLiquidity;
+        uint256 amountB = (liquidityPools[tokenB][tokenA] * poolTokenAmount) / totalLiquidity;
 
         // Update liquidity pools
         liquidityPools[tokenA][tokenB] -= amountA;
         liquidityPools[tokenB][tokenA] -= amountB;
 
         // Update user's share
-        liquidityProviderShares[msg.sender][tokenA] -= amountA;
-        liquidityProviderShares[msg.sender][tokenB] -= amountB;
+        poolTokens[msg.sender] -= poolTokenAmount;
 
-        // Transfer the liquidity back to the user
+        // Transfer tokens back to the user
         IToken(tokenA).transfer(msg.sender, amountA);
         IToken(tokenB).transfer(msg.sender, amountB);
 
-        emit LiquidityRemoved(msg.sender, tokenA, tokenB, amountA, amountB);
+        // Update total liquidity
+        totalLiquidity -= poolTokenAmount;
+
+        emit LiquidityRemoved(msg.sender, tokenA, tokenB, amountA, amountB, poolTokenAmount);
     }
 
-    // Swap tokens (including multi-token swaps)
-    function multiTokenSwap(address[] memory tokens, uint256[] memory amounts) public {
-        require(tokens.length == amounts.length, "Token list and amount list length mismatch");
-        require(tokens.length > 1, "At least 2 tokens are needed to perform a multi-token swap");
+    // Swap tokens
+    function swap(address tokenA, address tokenB, uint256 amount) public {
+        uint256 rate = exchangeRates[tokenA][tokenB];
+        require(rate > 0, "Exchange rate not set");
 
-        uint256 totalFee;
-        uint256[] memory amountsOut = new uint256[](tokens.length);
+        // Apply dynamic fee based on user swaps
+        uint256 fee = (amount * getDynamicFee(msg.sender)) / 100;
+        uint256 amountAfterFee = amount - fee;
 
-        // Iterate through the token sequence and perform swaps
-        for (uint256 i = 0; i < tokens.length - 1; i++) {
-            address tokenA = tokens[i];
-            address tokenB = tokens[i + 1];
-            uint256 amountIn = amounts[i];
+        // Transfer tokenA from the sender to the contract
+        IToken(tokenA).transferFrom(msg.sender, address(this), amount);
 
-            uint256 rate = exchangeRates[tokenA][tokenB];
-            require(rate > 0, "Exchange rate not set");
+        // Calculate the amount to receive in tokenB
+        uint256 amountToReceive = amountAfterFee * rate;
 
-            // Apply dynamic fee based on user swaps
-            uint256 fee = (amountIn * getDynamicFee(msg.sender)) / 100;
-            uint256 amountAfterFee = amountIn - fee;
+        // Ensure the contract has enough tokens to send
+        uint256 balanceTokenB = IToken(tokenB).balanceOf(address(this));
+        require(balanceTokenB >= amountToReceive, "Insufficient contract balance");
 
-            // Transfer tokenA from the sender to the contract
-            IToken(tokenA).transferFrom(msg.sender, address(this), amountIn);
+        // Transfer fee to the owner
+        IToken(tokenA).transfer(owner, fee);
 
-            // Calculate the amount to receive in tokenB
-            uint256 amountToReceive = amountAfterFee * rate;
+        // Transfer tokenB to the user
+        IToken(tokenB).transfer(msg.sender, amountToReceive);
 
-            // Ensure the contract has enough tokens to send
-            uint256 balanceTokenB = IToken(tokenB).balanceOf(address(this));
-            require(balanceTokenB >= amountToReceive, "Insufficient contract balance");
+        // Increment swap count for the user
+        userSwapCount[msg.sender]++;
 
-            // Transfer fee to the owner
-            IToken(tokenA).transfer(owner, fee);
-
-            // Update the amount to send in the next swap
-            amountsOut[i + 1] = amountToReceive;
-            emit TokensSwapped(msg.sender, tokens, amounts, amountsOut, fee);
-
-            // Increment swap count for the user
-            userSwapCount[msg.sender]++;
-        }
+        emit TokensSwapped(msg.sender, [tokenA, tokenB], [amount], [amountToReceive], fee);
     }
 
-    // Function to add liquidity (tokens) to the contract, allowing swaps
-    function addLiquidity(address token, uint256 amount) public onlyOwner {
-        IToken(token).transferFrom(msg.sender, address(this), amount);
-    }
-
-    // Function to remove liquidity (tokens) from the contract
-    function removeLiquidity(address token, uint256 amount) public onlyOwner {
-        uint256 contractBalance = IToken(token).balanceOf(address(this));
-        require(contractBalance >= amount, "Insufficient contract balance");
-        IToken(token).transfer(msg.sender, amount);
+    // Governance function to vote on fee models
+    function voteOnFeeModel(uint256 newFeePercentage) public {
+        require(governanceContract != address(0), "Governance contract not set");
+        // Allow users to vote on new fee model through governance contract (implement voting logic in governance contract)
     }
 
     // Function to get the current exchange rate between two tokens
