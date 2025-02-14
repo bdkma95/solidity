@@ -1,1 +1,1 @@
-# solidity
+# solidity smart contracts
