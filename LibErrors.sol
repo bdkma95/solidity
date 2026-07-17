@@ -18,7 +18,7 @@ library LibErrors {
     // Montants
     // -------------------------
 
-    /// @dev Utilisé pour mint, burn, complianceBurn
+    /// @dev Used for mint, burn, complianceBurn
     error ZeroAmount();
 
     /// @notice Thrown when a mint would push the total supply above MAX_SUPPLY.
@@ -41,17 +41,29 @@ library LibErrors {
     // Blacklist
     // -------------------------
 
-    /// @dev Opération interdite car l'adresse est blacklistée
+    /// @dev Forbidden Operation because the address is blacklisted
     error Blacklisted(address account);
 
-    /// @dev Tentative de blacklister une adresse déjà blacklistée
+    /// @dev Attempt to blacklist an address that has already been blacklisted
     error AlreadyBlacklisted(address account);
 
-    /// @dev Tentative d'opérer sur une adresse qui n'est PAS blacklistée
+    /// @dev Attempt to operate on an address that is NOT blacklisted
     ///      (ex: complianceBurn ou unblacklist)
     error NotBlacklisted(address account);
 
     error CannotRenounceLastRole(bytes32 role);
 
     error InsufficientBalance(address account, uint256 amount);
+
+    /// @dev Error raised when a burn attempt is made from an address
+    ///   which is not the authorized redemption address.
+    /// @param attempted The address from which the burn was attempted.
+    /// @param expected The expected redemption address.
+    error BurnOnlyAllowedFromRedemptionAddress(address attempted, address expected);
+    
+    /// @dev Error raised when a burn attempt is made from an address
+    ///   unauthorized (in the case of an address list).
+    /// @param account The unauthorized address.
+    error BurnNotAllowedFromAddress(address account);
+
 }

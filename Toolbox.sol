@@ -1,41 +1,84 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.27;
 //
-//  Smart Contract TOOLBOX — v1.0.0
-//  Bibliotheque de calculs financiers institutionnels
-//  Contrat auxiliaire du Smart Contract FondTokenise
+//  Smart Contract TOOLBOX — v2.0.0 (Phase 2)
+//  Institutional financial calculation library
+//  Auxiliary contract of the tokenized fund architecture
 //
-//  Conformite  : AMF / CSSF / AIFMD / MiFID II / EMIR / MMF Regulation EU 2017/1131
-//  Convention  : ACT/365 (Euro Money Market)
-//  Precision   : 18 decimales (wei-compatible, standard ERC20)
+//  Compliance : AMF / CSSF / AIFMD / MiFID II / EMIR / MMF Regulation EU 2017/1131
+//  Convention : ACT/365 (Euro Money Market)
+//  Precision  : 18 decimals (wei-compatible, standard ERC20)
+// =============================================================================
+//
+//  WHAT CHANGED IN v2.0.0 (Phase 2 architecture)
+//  -----------------------------------------------------------------------
+//  The fund is no longer a single monolithic contract. It is now split into
+//  four contracts:
+//
+//    EMT.sol            - plain ERC20, represents the fund's CASH (EUR),
+//                          minted/burned by the fund on subscription/redemption.
+//    TokenizedAssets.sol - plain ERC20, represents the tokenized SECURITIES
+//                          held in the fund's portfolio.
+//    TokenizedISIN.sol  - OpenZeppelin ERC20 + AccessControl + Pausable.
+//                          Represents the fund SHARES (liability side) AND
+//                          maintains the on-chain shareholder register
+//                          (whitelist / blacklist, amount invested, first
+//                          entry timestamp, last operation timestamp).
+//    Toolbox.sol (this) - stateless financial calculation engine.
+//
+//  The current fund contract in the repository, TokenizedFundPOC.sol, is a
+//  Phase 1 proof of concept that intentionally does NOT call a Toolbox
+//  ([POC-1] "NO TOOLBOX", [POC-2] "NO FEES") and reasons about a single
+//  security priced flat at 1 EUR. This Toolbox targets the richer Phase 2
+//  fund contract that will eventually replace/extend TokenizedFundPOC with
+//  fees, a multi-asset portfolio, and regulatory limits — it is the
+//  Toolbox that the "NO TOOLBOX" POC rule will be lifted for.
+//
+//  KEY DESIGN CHANGE — NO MORE SHADOW SHAREHOLDER REGISTER
+//  -----------------------------------------------------------------------
+//  The previous Toolbox kept its own investor bookkeeping (qualified
+//  investor flag, cumulative amount invested, first subscription date).
+//  That data now already lives in TokenizedISIN.ShareholderRecord and is
+//  updated atomically on every mint/burn/transfer. Keeping a second copy
+//  here would create two sources of truth that can silently drift apart
+//  (e.g. if the Fund forgets to call both contracts, or a call reverts on
+//  one side only). Instead, this Toolbox is a STATELESS rules engine for
+//  anything investor-specific: the Fund contract reads the relevant fields
+//  from TokenizedISIN.getShareholderRecord(investor) and passes them in as
+//  plain parameters (amountAlreadyInvested, firstEntryTimestamp). The
+//  Toolbox still owns and administers the parameters that are genuinely
+//  its own responsibility (fee grid, investment strategy, individual
+//  subscription cap, High Water Mark, commercial paper register).
+//
 // =============================================================================
 
 // =============================================================================
-// IMPORTS DES BIBLIOTHEQUES OPENZEPPELIN
+// OPENZEPPELIN LIBRARY IMPORTS
 // =============================================================================
-// Justification du choix de chaque bibliotheque pour le Toolbox :
+// Rationale for each library used by the Toolbox:
 //
-// AccessControl : Le Toolbox contient des parametres financiers critiques
-//   (grille de frais, strategie d'allocation). Leur modification doit etre
-//   restreinte aux seuls roles habilites. Un parametre de frais modifie sans
-//   controle pourrait constituer une manipulation frauduleuse du fonds.
+// AccessControl : The Toolbox holds critical financial parameters (fee grid,
+//   allocation strategy). Changing them must be restricted to authorized
+//   roles only. An unchecked fee parameter change could amount to fraudulent
+//   manipulation of the fund.
 //
-// Pausable : Circuit breaker en cas de bug de calcul detecte ou d'instruction
-//   reglementaire. Permet de geler les mises a jour des parametres sans
-//   impacter le contrat Fund (qui peut continuer a fonctionner en lecture).
+// Pausable : Circuit breaker in case a calculation bug is detected or a
+//   regulatory instruction requires it. Lets the Toolbox freeze parameter
+//   updates without impacting the Fund contract (which can keep operating
+//   in read-only mode).
 //
-// ReentrancyGuard : Meme si le Toolbox ne detient pas de fonds directement,
-//   les fonctions d'administration (mise a jour frais, strategie) doivent etre
-//   protegees contre les appels recursifs malveillants qui pourraient corrompre
-//   l'etat interne entre deux transactions du meme bloc.
+// ReentrancyGuard : Even though the Toolbox never holds funds directly, its
+//   administration functions (fee updates, strategy updates) must be
+//   protected against malicious recursive calls that could corrupt internal
+//   state between two transactions in the same block.
 //
-// Math (mulDiv) : Fonction cle pour la finance on-chain. mulDiv(a, b, c) calcule
-//   a*b/c avec precision maximale sans overflow intermediaire. INDISPENSABLE
-//   car en virgule fixe 18 dec, les produits intermediaires a*b depassent
-//   facilement uint256 avant la division finale.
+// Math (mulDiv) : Key primitive for on-chain finance. mulDiv(a, b, c)
+//   computes a*b/c with maximum precision and no intermediate overflow.
+//   INDISPENSABLE because at 18-decimal fixed point, intermediate products
+//   a*b easily exceed uint256 before the final division.
 //
-// SafeCast : Convertit uint256 <-> int256 sans risque de troncature silencieuse.
-//   Critique pour les calculs d'ajustements de portefeuille (valeurs signees).
+// SafeCast : Converts uint256 <-> int256 without silent truncation. Critical
+//   for signed portfolio-adjustment calculations.
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
@@ -44,952 +87,961 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 // =============================================================================
-// INTERFACE ITOOLBOX
+// ITOOLBOX INTERFACE
 // =============================================================================
-// Cette interface est la specification formelle du contrat entre FondTokenise
-// et Toolbox. Elle DOIT rester synchronisee avec celle declaree dans FondTokenise.sol.
-// Toute modification doit etre versionee, documentee, et auditee avant deploiement.
+// This interface is the formal contract between the (future) Phase 2 fund
+// contract and the Toolbox. It MUST stay in sync with whatever the fund
+// contract declares. Any change must be versioned, documented, and audited
+// before deployment.
 //
-// Pourquoi declarer l'interface dans le meme fichier ?
-//   - Permet au compilateur de verifier que Toolbox respecte bien son contrat
-//   - Facilite la generation d'ABI pour les integrateurs off-chain
-//   - Reduit le risque de desynchronisation entre les deux contrats
+// Why declare the interface in the same file?
+//   - Lets the compiler verify the Toolbox actually honors its contract
+//   - Makes ABI generation easier for off-chain integrators
+//   - Reduces the risk of drift between the two contracts
 
 interface IToolbox {
-    function calculerDepreciationLineaire(
-        uint256 valeurNominale,
-        uint256 tauxAnnuel,
-        uint256 dureeJours,
-        uint256 joursEcoules
-    ) external pure returns (uint256 valeurActuelle);
+    function calculateLinearDepreciation(
+        uint256 faceValue,
+        uint256 annualRateBp,
+        uint256 durationDays,
+        uint256 daysElapsed
+    ) external pure returns (uint256 currentValue);
 
-    function calculerFrais(
-        uint256 montant,
-        uint8 typeOperation
-    ) external view returns (uint256 frais);
+    function calculateFees(
+        uint256 amount,
+        uint8 operationType
+    ) external view returns (uint256 fee);
 
-    function calculerAjustementsPortefeuille(
-        uint256 valeurTotalePortefeuille,
-        uint256[] calldata allocationsActuelles,
-        uint256[] calldata allocationsCibles
-    ) external pure returns (int256[] memory ajustements);
+    function calculatePortfolioAdjustments(
+        uint256 totalPortfolioValue,
+        uint256[] calldata currentAllocations,
+        uint256[] calldata targetAllocations
+    ) external pure returns (int256[] memory adjustments);
 
-    function validerConformite(
-        address investisseur,
-        uint256 montant,
-        uint8 typeOperation
-    ) external view returns (bool estValide);
+    /// @param amountAlreadyInvested Cumulative amount already invested by
+    ///   `investor`, as read by the caller from
+    ///   TokenizedISIN.getShareholderRecord(investor).amountInvested.
+    ///   Ignored for redemptions.
+    function validateCompliance(
+        address investor,
+        uint256 amount,
+        uint8 operationType,
+        uint256 amountAlreadyInvested
+    ) external view returns (bool isValid);
 }
 
 // =============================================================================
 // SMART CONTRACT TOOLBOX
 // =============================================================================
-// Role dans l'architecture a 4 contrats :
+// Role in the Phase 2 architecture:
 //
-//   FondTokenise (contrat central)
+//   TokenizedFundPhase2 (future orchestrator contract)
 //       |
-//       |-- appelle --> Toolbox (ce contrat)
-//       |-- emet vers -> TokenizedAsset
-//       |-- coordonne -> TokenizedAssetHolding
+//       |-- calls -----> Toolbox (this contract, stateless calculations)
+//       |-- mints/burns -> EMT (cash)
+//       |-- mints/burns -> TokenizedAssets (securities)
+//       |-- mints/burns -> TokenizedISIN (shares + shareholder register)
 //
-// Ce contrat centralise :
-//   MODULE 1 : Calcul de depreciation lineaire des instruments de taux (NEU CP)
-//   MODULE 2 : Structure et calcul des frais (entree, sortie, gestion, performance)
-//   MODULE 3 : Strategie d'investissement et reequilibrage du portefeuille
-//   MODULE 4 : Validation de conformite reglementaire (limites, concentration, lock-up)
-//   MODULE 5 : Calculs actuariels avances (interets composes, taux de rendement, duration)
-//   MODULE 6 : Calculs de valorisation NAV avances (NAV nette, parts a emettre/racheter)
-//   MODULE 7 : Administration et parametrage du Toolbox
+// This contract centralizes:
+//   MODULE 1 : Linear depreciation of fixed-income instruments (NEU CP)
+//   MODULE 2 : Fee structure and calculation (entry, exit, management, performance)
+//   MODULE 3 : Investment strategy and portfolio rebalancing
+//   MODULE 4 : Regulatory compliance validation (limits, concentration, lock-up)
+//   MODULE 5 : Advanced actuarial calculations (compound interest, yield, duration)
+//   MODULE 6 : Advanced NAV valuation calculations (net NAV, shares to issue/redeem)
+//   MODULE 7 : Toolbox administration and parameterization
 //
-// Avantages de l'externalisation dans un Toolbox distinct :
-//   SEPARATION DES RESPONSABILITES : Fund = cycle de vie des ordres ;
-//     Toolbox = logique financiere et reglementaire. Auditabilite independante.
-//   UPGRADABILITE CONTROLEE : nouvelle grille de frais = nouveau Toolbox deploye
-//     + appel a FondTokenise.mettreAJourToolbox(). Les fonds ne bougent pas.
-//   REUTILISABILITE : TokenizedAsset et TokenizedAssetHolding utilisent les memes
-//     fonctions de calcul (depreciation, taux, duration) sans dupliquer le code.
-//   GAS EFFICIENCY : Les fonctions pure/view ne consomment pas de gas hors transaction.
+// Benefits of externalizing this logic into a separate Toolbox:
+//   SEPARATION OF CONCERNS : Fund = order lifecycle; Toolbox = financial and
+//     regulatory logic. Independent auditability.
+//   CONTROLLED UPGRADABILITY : a new fee grid = a new Toolbox deployed +
+//     a call to Fund.updateToolbox(). Funds never move.
+//   REUSABILITY : any future satellite contract can reuse the same
+//     calculation functions (depreciation, rates, duration) without
+//     duplicating code.
+//   GAS EFFICIENCY : pure/view functions cost no gas outside of the
+//     calling transaction.
 
 contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
 
     // =========================================================================
-    // UTILISATION DES BIBLIOTHEQUES
+    // LIBRARY USAGE
     // =========================================================================
-    // On declare l'usage de Math et SafeCast pour toutes les variables uint256/int256.
-    // Cela permet d'appeler directement a.mulDiv(b, c) ou a.toInt256().
+    // Declares usage of Math and SafeCast for all uint256/int256 variables.
+    // Allows calling a.mulDiv(b, c) or a.toInt256() directly.
     using Math for uint256;
     using SafeCast for uint256;
     using SafeCast for int256;
 
     // =========================================================================
-    // DEFINITION DES ROLES (RBAC)
+    // ROLE DEFINITIONS (RBAC)
     // =========================================================================
-    // Principe des quatre yeux (two-man rule) applique :
-    // La modification d'un parametre financier critique doit etre autorisee
-    // par un role distinct du role d'execution des ordres.
+    // Four-eyes principle (two-man rule) applied throughout:
+    // Changing a critical financial parameter must be authorized by a role
+    // distinct from the role that executes orders.
 
-    /// @dev Gestionnaire de portefeuille : modifie la strategie d'allocation
-    bytes32 public constant ROLE_GESTIONNAIRE = keccak256("GESTIONNAIRE");
+    /// @dev Portfolio manager: changes the allocation strategy
+    bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
 
-    /// @dev Administrateur des frais : modifie la grille tarifaire
-    /// Separe du Gestionnaire : un gestionnaire ne doit pas pouvoir fixer ses propres frais.
-    bytes32 public constant ROLE_ADMIN_FRAIS = keccak256("ADMIN_FRAIS");
+    /// @dev Fee administrator: changes the fee grid.
+    /// Separate from MANAGER_ROLE: a manager must not be able to set their
+    /// own fees.
+    bytes32 public constant FEE_ADMIN_ROLE = keccak256("FEE_ADMIN_ROLE");
 
-    /// @dev Compliance Officer : gere les investisseurs qualifies et limites reglementaires
-    bytes32 public constant ROLE_COMPLIANCE = keccak256("COMPLIANCE");
+    /// @dev Compliance officer: manages regulatory thresholds
+    bytes32 public constant COMPLIANCE_ROLE = keccak256("COMPLIANCE_ROLE");
 
-    /// @dev Administrateur principal du Toolbox
-    bytes32 public constant ROLE_ADMIN = keccak256("ADMIN");
+    /// @dev Principal Toolbox administrator
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
-    /// @dev Contrat Fund autorise : seul FondTokenise peut appeler les fonctions stateful
-    /// Protege contre l'utilisation non autorisee du Toolbox par des contrats tiers.
-    bytes32 public constant ROLE_FOND_AUTORISE = keccak256("FOND_AUTORISE");
+    /// @dev Authorized Fund contract: only the Phase 2 fund contract may
+    ///   call the stateful functions. Protects against unauthorized use of
+    ///   the Toolbox by third-party contracts.
+    bytes32 public constant FUND_AUTHORIZED_ROLE = keccak256("FUND_AUTHORIZED_ROLE");
 
     // =========================================================================
-    // CONSTANTES FINANCIERES FONDAMENTALES
+    // FUNDAMENTAL FINANCIAL CONSTANTS
     // =========================================================================
-    // On utilise des constantes (gravees dans le bytecode) plutot que des variables
-    // pour les parametres qui ne doivent JAMAIS changer apres deploiement.
-    // Avantage gas : les constantes ne consomment pas de SLOAD (pas de lecture storage).
+    // Constants (burned into bytecode) rather than variables, for parameters
+    // that must NEVER change after deployment. Gas advantage: constants do
+    // not consume an SLOAD (no storage read).
 
-    /// @notice Precision en virgule fixe : 18 decimales (1 EUR = 1e18 unites)
-    /// Standard ERC20 et compatible avec les calculs de prix en wei.
+    /// @notice Fixed-point precision: 18 decimals (1 EUR = 1e18 units)
+    /// ERC20 standard, compatible with wei-denominated price calculations.
     uint256 public constant PRECISION = 1e18;
 
-    /// @notice Base en points de base (1 bp = 0.01%, 10 000 bp = 100%)
-    /// Evite l'utilisation de nombres decimaux (non supportes nativement en Solidity).
-    /// Tout taux est exprime en bp : 350 bp = 3.50%.
+    /// @notice Basis points base (1 bp = 0.01%, 10,000 bp = 100%)
+    /// Avoids using decimal numbers (not natively supported in Solidity).
+    /// Every rate is expressed in bp: 350 bp = 3.50%.
     uint256 public constant BASE_POINTS = 10_000;
 
-    /// @notice Jours par an — Convention ACT/365 (Euro Money Market)
-    /// ACT/365 est la convention standard pour les instruments de taux en EUR :
-    /// NEU CP (ex-billets de tresorerie), OAT, BTF, et autres instruments francais.
-    /// Alternative : ACT/360 pour certains depots bancaires. On choisit ACT/365.
-    uint256 public constant JOURS_PAR_AN = 365;
+    /// @notice Days per year — ACT/365 convention (Euro Money Market)
+    /// ACT/365 is the standard convention for EUR-denominated rate
+    /// instruments: NEU CP (formerly "billets de tresorerie"), OAT, BTF,
+    /// and other French instruments.
+    /// Alternative: ACT/360 for certain bank deposits. We choose ACT/365.
+    uint256 public constant DAYS_PER_YEAR = 365;
 
-    /// @notice Secondes par an (ACT/365, sans annee bissextile)
-    /// Utilise pour les calculs prorata temporis des frais de gestion.
-    uint256 public constant SECONDES_PAR_AN = 365 days;
+    /// @notice Seconds per year (ACT/365, no leap year)
+    /// Used for prorata temporis calculations of management fees.
+    uint256 public constant SECONDS_PER_YEAR = 365 days;
 
-    /// @notice Montant minimum absolu de souscription institutionnelle
-    /// 100 000 EUR : seuil reglementaire investisseur qualifie (Art. 423-27 AMF)
-    /// et investisseur averti (Art. L533-16 CMF). Standard marche ASPIM.
-    uint256 public constant SOUSCRIPTION_MINIMUM = 100_000 * PRECISION;
+    /// @notice Absolute minimum institutional subscription amount
+    /// 100,000 EUR: regulatory threshold for qualified investors
+    /// (Art. 423-27 AMF) and informed investors (Art. L533-16 CMF).
+    /// Standard ASPIM market practice.
+    uint256 public constant MINIMUM_SUBSCRIPTION = 100_000 * PRECISION;
 
-    /// @notice Concentration maximale par emetteur en bp
-    /// 20% max : regle de diversification inspiree de l'Article 22 UCITS,
-    /// adaptee aux fonds alternatifs. Limite le risque de contrepartie.
-    uint256 public constant CONCENTRATION_MAX_EMETTEUR_BP = 2_000;
+    /// @notice Maximum concentration per issuer, in bp
+    /// 20% max: diversification rule inspired by UCITS Article 22, adapted
+    /// for alternative funds. Limits counterparty risk.
+    uint256 public constant MAX_ISSUER_CONCENTRATION_BP = 2_000;
 
-    /// @notice Ratio de liquidite minimum du portefeuille en bp
-    /// 10% minimum : exigence prudentielle pour honorer les rachats quotidiens.
-    /// Conforme au Reglement MMF EU 2017/1131 (fonds monetaires a valeur liquidative variable).
-    uint256 public constant RATIO_LIQUIDITE_MIN_BP = 1_000;
+    /// @notice Minimum portfolio liquidity ratio, in bp
+    /// 10% minimum: prudential requirement to honor daily redemptions.
+    /// Compliant with MMF Regulation EU 2017/1131 (variable NAV money
+    /// market funds).
+    uint256 public constant MIN_LIQUIDITY_RATIO_BP = 1_000;
 
-    /// @notice Periode de lock-up minimum : 90 jours (standard AIFMD Art. 23)
-    uint256 public constant PERIODE_LOCK_UP = 90 days;
+    /// @notice Minimum lock-up period: 90 days (AIFMD Art. 23 standard)
+    uint256 public constant LOCK_UP_PERIOD = 90 days;
 
-    /// @notice Nombre maximum d'actifs dans le portefeuille
-    /// Plafond a 50 : evite les boucles trop longues qui depasseraient la gas limit.
-    /// Un portefeuille institutionnel MMF n'excede generalement pas 30 lignes.
-    uint256 public constant MAX_ACTIFS_PORTEFEUILLE = 50;
+    /// @notice Maximum number of assets in the portfolio
+    /// Capped at 50: avoids loops long enough to exceed the gas limit.
+    /// An institutional MMF portfolio generally does not exceed 30 lines.
+    uint256 public constant MAX_PORTFOLIO_ASSETS = 50;
 
     // =========================================================================
-    // STRUCTURES DE DONNEES
+    // DATA STRUCTURES
     // =========================================================================
 
     // -------------------------------------------------------------------------
-    // STRUCTURE DE FRAIS
+    // FEE STRUCTURE
     // -------------------------------------------------------------------------
-    // Architecture de frais a 3 couches, standard hedge fund / fonds reserves :
+    // Three-layer fee architecture, standard hedge fund / reserved fund
+    // practice:
     //
-    //   COUCHE 1 - Frais de transaction (preleves sur chaque ordre)
-    //     Frais d'entree (souscription) et frais de sortie (rachat).
-    //     Exprimes en bp du montant brut.
+    //   LAYER 1 - Transaction fees (charged on each order)
+    //     Entry fee (subscription) and exit fee (redemption).
+    //     Expressed in bp of the gross amount.
     //
-    //   COUCHE 2 - Frais courants annuels (provisionnes prorata a chaque cycle NAV)
-    //     Management fee + frais depositaire + frais admin.
-    //     Reduisent l'ANT a chaque cycle, donc la NAV par part.
+    //   LAYER 2 - Ongoing annual fees (accrued prorata at every NAV cycle)
+    //     Management fee + custody fee + admin fee.
+    //     Reduce net assets at every cycle, hence NAV per share.
     //
-    //   COUCHE 3 - Frais de performance (High Water Mark)
-    //     Preleves uniquement si NAV > HWM + hurdle rate.
-    //     Evite la double facturation des memes gains.
-    //     Cristallises annuellement ou a chaque rachat.
+    //   LAYER 3 - Performance fees (High Water Mark)
+    //     Charged only if NAV > HWM + hurdle rate.
+    //     Avoids double-charging the same gains.
+    //     Crystallized annually or on each redemption.
 
-    /// @notice Structure complete des frais du fonds
-    /// Tous les taux sont en points de base (bp).
-    struct StructureFrais {
-        uint256 fraisSouscriptionEntrantBp;  // Frais d'entree (ex: 50 bp = 0.50%)
-        uint256 fraisRachatSortantBp;        // Frais de sortie (ex: 25 bp = 0.25%)
-        uint256 fraisGestionAnnuelsBp;       // Management fee annuel (ex: 100 bp = 1.00%/an)
-        uint256 fraisPerformanceBp;          // Part de la surperf (ex: 2000 bp = 20%)
-        uint256 hurleRate;                   // Rendement min avant frais perf (ex: 300 bp = 3%/an)
-        uint256 fraisDepositaireAnnuelsBp;   // Frais depositaire annuels (ex: 5 bp = 0.05%/an)
-        uint256 fraisAdminAnnuelsBp;         // Frais administratifs annuels (ex: 10 bp = 0.10%/an)
-        uint256 fraisRachatAnticieBp;        // Penalite rachat avant lock-up (ex: 200 bp = 2%)
-        uint256 derniereMiseAJour;           // Timestamp de la derniere mise a jour
+    /// @notice Complete fee structure of the fund
+    /// All rates are expressed in basis points (bp).
+    struct FeeStructure {
+        uint256 subscriptionFeeBp;       // Entry fee (e.g. 50 bp = 0.50%)
+        uint256 redemptionFeeBp;         // Exit fee (e.g. 25 bp = 0.25%)
+        uint256 annualManagementFeeBp;   // Annual management fee (e.g. 100 bp = 1.00%/yr)
+        uint256 performanceFeeBp;        // Share of outperformance (e.g. 2000 bp = 20%)
+        uint256 hurdleRateBp;            // Minimum return before perf fees (e.g. 300 bp = 3%/yr)
+        uint256 annualCustodyFeeBp;      // Annual custody fee (e.g. 5 bp = 0.05%/yr)
+        uint256 annualAdminFeeBp;        // Annual admin fee (e.g. 10 bp = 0.10%/yr)
+        uint256 earlyRedemptionPenaltyBp;// Penalty for redemption before lock-up (e.g. 200 bp = 2%)
+        uint256 lastUpdateTimestamp;     // Timestamp of the last update
     }
 
     // -------------------------------------------------------------------------
-    // STRATEGIE D'INVESTISSEMENT
+    // INVESTMENT STRATEGY
     // -------------------------------------------------------------------------
-    // La strategie definit les allocations cibles par classe d'actifs et les
-    // parametres de risque du portefeuille.
-    // Elle est definie par le gestionnaire et validee par le comite d'investissement.
+    // The strategy defines target allocations per asset class and portfolio
+    // risk parameters. It is set by the manager and validated by the
+    // investment committee.
 
-    /// @notice Parametres de la strategie d'investissement
-    struct StrategieInvestissement {
-        uint256 allocationBilletsTresorerieBp;  // NEU CP / Commercial Paper (< 1 an)
-        uint256 allocationObligationsBp;         // Obligations souveraines / corp IG
-        uint256 allocationActionsBp;             // Actions (0 pour un MMF pur)
-        uint256 allocationLiquiditesBp;          // Liquidites (plancher de securite)
+    /// @notice Investment strategy parameters
+    struct InvestmentStrategy {
+        uint256 commercialPaperAllocationBp; // NEU CP / Commercial Paper (< 1 year)
+        uint256 bondAllocationBp;            // Sovereign bonds / IG corporate bonds
+        uint256 equityAllocationBp;          // Equities (0 for a pure MMF)
+        uint256 cashAllocationBp;            // Cash (safety floor)
 
-        // Tolerance de deviation avant reequilibrage :
-        // Si l'allocation reelle d'un actif s'ecarte de plus de toleranceDeviationBp
-        // de sa cible, le remplacement est declenche.
-        // Ex: 100 bp = reequilibrage si ecart > 1%
-        uint256 toleranceDeviationBp;
+        // Deviation tolerance before rebalancing:
+        // If an asset's actual allocation deviates from its target by more
+        // than deviationToleranceBp, rebalancing is triggered.
+        // E.g. 100 bp = rebalance if deviation > 1%
+        uint256 deviationToleranceBp;
 
-        // Duration maximale du portefeuille en jours.
-        // Limite l'exposition au risque de taux.
-        // Standard MMF court terme ESMA : 60j (WAM) / 120j (WAL)
-        // On utilise 90j comme valeur prudente.
-        uint256 durationMaxJours;
+        // Maximum portfolio duration in days.
+        // Limits interest rate risk exposure.
+        // Short-term MMF ESMA standard: 60d (WAM) / 120d (WAL).
+        // We use 90d as a conservative value.
+        uint256 maxDurationDays;
 
-        // Rating minimum des contreparties (encode : 1=AAA, 2=AA+, 3=AA, 4=AA-, 5=A+, 6=A, 7=A-)
-        // Conforme aux exigences ESMA pour les MMF (Reglement 2017/1131 Art. 19)
-        uint8 ratingMinimumContrepartie;
+        // Minimum counterparty rating (encoded: 1=AAA, 2=AA+, 3=AA, 4=AA-,
+        // 5=A+, 6=A, 7=A-). Compliant with ESMA MMF requirements
+        // (Regulation 2017/1131 Art. 19).
+        uint8 minCounterpartyRating;
 
-        uint256 derniereMiseAJour;
+        uint256 lastUpdateTimestamp;
     }
 
     // -------------------------------------------------------------------------
     // HIGH WATER MARK
     // -------------------------------------------------------------------------
-    // Mecanisme standard de protection des investisseurs :
-    // Les frais de performance ne sont dus que si la NAV par part depasse
-    // son plus haut historique. Evite de facturer les memes gains deux fois.
-    // Exemple : NAV monte a 1050, puis retombe a 980, puis remonte a 1030.
-    // Frais de perf uniquement preleves sur la hausse de 980 vers 1050 (1ere fois),
-    // PAS sur la hausse de 980 vers 1030 (le HWM est toujours a 1050).
+    // Standard investor-protection mechanism: performance fees are only due
+    // if NAV per share exceeds its historical high. Avoids charging the
+    // same gains twice.
+    // Example: NAV rises to 1050, falls back to 980, then rises to 1030.
+    // Performance fees are only charged on the rise from 980 to 1050 (the
+    // first time), NOT on the rise from 980 to 1030 (HWM is still 1050).
 
-    /// @notice Registre du High Water Mark pour les frais de performance
+    /// @notice High Water Mark register for performance fees
     struct HighWaterMark {
-        uint256 valeurHauteur;  // Plus haut historique de NAV par part (EUR, 18 dec)
-        uint256 horodatage;     // Timestamp d'atteinte du plus haut
-        uint256 cycleNAV;       // Numero du cycle NAV ayant etabli le plus haut
+        uint256 highValue;   // Historical high of NAV per share (EUR, 18 dec)
+        uint256 timestamp;   // Timestamp the high was reached
+        uint256 navCycle;    // NAV cycle number that established the high
     }
 
     // -------------------------------------------------------------------------
-    // BILLET DE TRESORERIE (NEU CP)
+    // COMMERCIAL PAPER (NEU CP)
     // -------------------------------------------------------------------------
-    // Parametres complets d'un billet de tresorerie pour suivi de valorisation.
-    // Les NEU CP (Negotiable European Commercial Paper, anciennement billets de
-    // tresorerie) sont des instruments de taux court terme emis par des entreprises
-    // ou etablissements de credit, generallement a discount (sous le pair).
+    // Complete parameters of a commercial paper instrument, for valuation
+    // tracking. NEU CP (Negotiable European Commercial Paper) are short-term
+    // rate instruments issued by corporates or credit institutions,
+    // generally at a discount (below par).
 
-    /// @notice Parametres d'un billet de tresorerie pour le calcul de depreciation
-    struct ParametresBilletTresorerie {
-        bytes32 identifiant;       // ISIN (ex: keccak256("FR0000000000"))
-        uint256 valeurNominale;    // Valeur a maturite en EUR (18 dec)
-        uint256 prixAcquisition;   // Prix d'achat en EUR (18 dec, <= nominal pour un discount)
-        uint256 tauxRendementBp;   // Taux de rendement actuariel annualise (bp)
-        uint256 dateEmission;      // Timestamp Unix d'emission
-        uint256 dateMaturite;      // Timestamp Unix de maturite
-        uint256 dureeJours;        // Duree totale en jours (calcule a l'enregistrement)
-        bool estActif;             // True si l'instrument est encore en portefeuille
+    /// @notice Parameters of a commercial paper instrument for depreciation calculation
+    struct CommercialPaperParameters {
+        bytes32 identifier;       // ISIN (e.g. keccak256("FR0000000000"))
+        uint256 faceValue;        // Value at maturity in EUR (18 dec)
+        uint256 acquisitionPrice; // Purchase price in EUR (18 dec, <= face value for a discount)
+        uint256 yieldRateBp;      // Annualized actuarial yield rate (bp)
+        uint256 issuanceDate;     // Unix timestamp of issuance
+        uint256 maturityDate;     // Unix timestamp of maturity
+        uint256 durationDays;     // Total duration in days (computed at registration)
+        bool    isActive;         // True if the instrument is still in the portfolio
     }
 
-    /// @notice Resultat detaille d'une valorisation de billet
-    struct ResultatValorisation {
-        uint256 valeurActuelle;         // Valeur actuelle de l'instrument (EUR, 18 dec)
-        uint256 interetsCourus;         // Interets courus depuis l'emission (EUR, 18 dec)
-        uint256 joursEcoules;           // Jours ecoules depuis l'emission
-        uint256 joursRestants;          // Jours restants jusqu'a maturite
-        uint256 rendementJournalier;    // Rendement journalier en unites PRECISION
-        bool estEchu;                   // True si la maturite est depassee
+    /// @notice Detailed valuation result of a commercial paper instrument
+    struct ValuationResult {
+        uint256 currentValue;     // Current value of the instrument (EUR, 18 dec)
+        uint256 accruedInterest;  // Interest accrued since issuance (EUR, 18 dec)
+        uint256 daysElapsed;      // Days elapsed since issuance
+        uint256 daysRemaining;    // Days remaining until maturity
+        uint256 dailyYield;       // Daily yield, in PRECISION units
+        bool    isMatured;        // True if maturity has passed
     }
 
     // =========================================================================
-    // VARIABLES D'ETAT
+    // STATE VARIABLES
     // =========================================================================
-    // Toutes les variables d'etat sont private avec getters publics dediés.
-    // Principe de moindre exposition des donnees internes (least privilege).
+    // All state variables are private with dedicated public getters.
+    // Least-privilege principle for internal data exposure.
+    //
+    // NOTE: there is deliberately no investor-level bookkeeping here
+    // (whitelist flag, cumulative amount invested, first-entry date). That
+    // data is owned by TokenizedISIN.ShareholderRecord — see the
+    // "KEY DESIGN CHANGE" note at the top of this file.
 
-    /// @notice Structure de frais actuellement en vigueur
-    StructureFrais private _frais;
+    /// @notice Fee structure currently in effect
+    FeeStructure private _fees;
 
-    /// @notice Strategie d'investissement en vigueur
-    StrategieInvestissement private _strategie;
+    /// @notice Investment strategy currently in effect
+    InvestmentStrategy private _strategy;
 
-    /// @notice Registre du High Water Mark
+    /// @notice High Water Mark register
     HighWaterMark private _highWaterMark;
 
-    /// @notice Registre des billets de tresorerie suivis : ISIN => parametres
-    mapping(bytes32 => ParametresBilletTresorerie) private _billetsTresorerie;
+    /// @notice Registry of tracked commercial paper instruments: ISIN => parameters
+    mapping(bytes32 => CommercialPaperParameters) private _commercialPapers;
 
-    /// @notice Liste des identifiants de billets (pour iteration et audit)
-    bytes32[] private _listeIdentifiantsBillets;
+    /// @notice List of paper identifiers (for iteration and audit)
+    bytes32[] private _paperIdentifierList;
 
-    /// @notice Registre des investisseurs qualifies (valides par ROLE_COMPLIANCE)
-    /// Note : le whitelisting KYC principal est dans FondTokenise.
-    /// Ici on stocke les criteres financiers complementaires (plafonds, lock-up).
-    mapping(address => bool) private _investisseursQualifies;
+    /// @notice Default individual subscription cap (EUR, 18 dec)
+    /// Protects against excessive concentration in a single investor.
+    uint256 private _individualSubscriptionCapEUR;
 
-    /// @notice Montants investis cumules par investisseur (pour les plafonds de concentration)
-    mapping(address => uint256) private _montantsInvestisParInvestisseur;
-
-    /// @notice Date de premiere souscription par investisseur (pour le calcul du lock-up)
-    mapping(address => uint256) private _datePremiereEntree;
-
-    /// @notice Plafond de souscription individuel par defaut (EUR, 18 dec)
-    /// Protege contre la concentration excessive d'un seul investisseur.
-    uint256 private _plafondSouscriptionIndividuelEUR;
-
-    /// @notice Version du Toolbox (pour traçabilite des mises a jour)
+    /// @notice Toolbox version (for update traceability)
     string public version;
 
     // =========================================================================
-    // EVENEMENTS (EVENTS)
+    // EVENTS
     // =========================================================================
-    // Tous les evenements sont indexes pour permettre des requetes efficaces.
-    // Ils constituent la trace immuable de toutes les modifications de parametres.
+    // All events are indexed to allow efficient querying. They form the
+    // immutable trail of every parameter change.
 
-    /// @notice Emis lors d'une mise a jour de la structure de frais
-    event FraisMisAJour(
-        uint256 fraisSouscriptionBp,
-        uint256 fraisRachatBp,
-        uint256 fraisGestionBp,
-        uint256 fraisPerformanceBp,
-        uint256 horodatage,
-        address indexed responsable
+    /// @notice Emitted when the fee structure is updated
+    event FeesUpdated(
+        uint256 subscriptionFeeBp,
+        uint256 redemptionFeeBp,
+        uint256 annualManagementFeeBp,
+        uint256 performanceFeeBp,
+        uint256 timestamp,
+        address indexed updatedBy
     );
 
-    /// @notice Emis lors d'une mise a jour de la strategie d'investissement
-    event StrategieMiseAJour(
-        uint256 allocationBilletsBp,
-        uint256 allocationObligationsBp,
-        uint256 toleranceDeviationBp,
-        uint256 durationMaxJours,
-        uint256 horodatage,
-        address indexed gestionnaire
+    /// @notice Emitted when the investment strategy is updated
+    event StrategyUpdated(
+        uint256 commercialPaperAllocationBp,
+        uint256 bondAllocationBp,
+        uint256 deviationToleranceBp,
+        uint256 maxDurationDays,
+        uint256 timestamp,
+        address indexed manager
     );
 
-    /// @notice Emis lors de l'enregistrement d'un nouveau billet de tresorerie
-    event BilletTresorerieEnregistre(
-        bytes32 indexed identifiant,
-        uint256 valeurNominale,
-        uint256 tauxRendementBp,
-        uint256 dureeJours,
-        uint256 horodatage
+    /// @notice Emitted when a new commercial paper instrument is registered
+    event CommercialPaperRegistered(
+        bytes32 indexed identifier,
+        uint256 faceValue,
+        uint256 yieldRateBp,
+        uint256 durationDays,
+        uint256 timestamp
     );
 
-    /// @notice Emis lors de la mise a jour du High Water Mark
-    event HighWaterMarkMisAJour(
-        uint256 ancienneValeur,
-        uint256 nouvelleValeur,
-        uint256 cycleNAV,
-        uint256 horodatage
+    /// @notice Emitted when the High Water Mark is updated
+    event HighWaterMarkUpdated(
+        uint256 previousValue,
+        uint256 newValue,
+        uint256 navCycle,
+        uint256 timestamp
     );
 
-    /// @notice Emis lors d'une alerte de conformite (non-bloquante, pour monitoring)
-    event AlerteConformite(
-        address indexed investisseur,
-        string motif,
-        uint256 montant,
-        uint256 horodatage
+    /// @notice Emitted on a compliance alert (non-blocking, for monitoring)
+    /// @dev Reserved for future use by stateful functions; validateCompliance()
+    ///   itself is a view function and cannot emit events, so off-chain
+    ///   monitoring must watch its return value directly.
+    event ComplianceAlert(
+        address indexed investor,
+        string reason,
+        uint256 amount,
+        uint256 timestamp
     );
 
-    /// @notice Emis lors de l'enregistrement d'un investisseur qualifie dans le Toolbox
-    event InvestisseurQualifieEnregistre(
-        address indexed investisseur,
-        uint256 plafondIndividuelEUR,
-        uint256 horodatage
-    );
-
-    /// @notice Emis lors d'une mise a jour du plafond individuel de souscription
-    event PlafondMisAJour(
-        uint256 ancienPlafond,
-        uint256 nouveauPlafond,
-        uint256 horodatage
+    /// @notice Emitted when the individual subscription cap is updated
+    event SubscriptionCapUpdated(
+        uint256 previousCap,
+        uint256 newCap,
+        uint256 timestamp
     );
 
     // =========================================================================
-    // MODIFICATEURS
+    // MODIFIERS
     // =========================================================================
 
-    /// @dev Restreint les appels stateful au seul contrat Fund autorise.
-    /// Evite qu'un contrat tiers puisse manipuler les parametres du HWM ou les
-    /// montants investis via des appels directs non autorises au Toolbox.
-    modifier seulementFondAutorise() {
+    /// @dev Restricts stateful calls to the single authorized Fund contract.
+    /// Prevents a third-party contract from manipulating HWM parameters or
+    /// invested amounts through unauthorized direct calls to the Toolbox.
+    modifier onlyAuthorizedFund() {
         require(
-            hasRole(ROLE_FOND_AUTORISE, msg.sender),
-            "TOOLBOX: Appelant non autorise - Seul le contrat Fund peut appeler"
+            hasRole(FUND_AUTHORIZED_ROLE, msg.sender),
+            "TOOLBOX: Unauthorized caller - Only the Fund contract may call this"
         );
         _;
     }
 
-    /// @dev Verifie que la somme des allocations cibles est exactement 100%
-    /// On tolere un ecart de +/-1 bp pour absorber les arrondis eventuels.
-    modifier allocationsTotalisent100Pourcent(
-        uint256 billets,
-        uint256 obligations,
-        uint256 actions,
-        uint256 liquidites
+    /// @dev Verifies that target allocations sum to exactly 100%.
+    /// A +/-1 bp tolerance is allowed to absorb rounding.
+    modifier targetAllocationsSum100Percent(
+        uint256 commercialPaper,
+        uint256 bonds,
+        uint256 equities,
+        uint256 cash
     ) {
-        uint256 total = billets + obligations + actions + liquidites;
+        uint256 total = commercialPaper + bonds + equities + cash;
         require(
             total >= BASE_POINTS - 1 && total <= BASE_POINTS + 1,
-            "TOOLBOX: Allocations cibles ne totalisent pas 100% (+/- 1bp tolere)"
+            "TOOLBOX: Target allocations do not sum to 100% (+/- 1bp tolerance)"
         );
         _;
     }
 
     // =========================================================================
-    // CONSTRUCTEUR
+    // CONSTRUCTOR
     // =========================================================================
 
-    /// @notice Deploie le Toolbox et initialise les parametres financiers par defaut
-    /// @param adresseAdmin Adresse recevant tous les roles initialement
-    /// @param versionContrat Version du contrat (ex: "1.0.0")
+    /// @notice Deploys the Toolbox and initializes default financial parameters
+    /// @param adminAddress Address receiving all roles initially
+    /// @param contractVersion Contract version (e.g. "2.0.0")
     ///
-    /// @dev Les valeurs par defaut correspondent a un fonds monetaire institutionnel
-    /// standard, conforme au Reglement MMF EU 2017/1131 et aux pratiques AFG/ASPIM.
+    /// @dev Default values correspond to a standard institutional money
+    /// market fund, compliant with MMF Regulation EU 2017/1131 and
+    /// AFG/ASPIM market practice.
     constructor(
-        address adresseAdmin,
-        string memory versionContrat
+        address adminAddress,
+        string memory contractVersion
     ) {
-        require(adresseAdmin != address(0), "TOOLBOX: Adresse admin invalide");
-        require(bytes(versionContrat).length > 0, "TOOLBOX: Version vide");
+        require(adminAddress != address(0), "TOOLBOX: Invalid admin address");
+        require(bytes(contractVersion).length > 0, "TOOLBOX: Empty version");
 
-        version = versionContrat;
+        version = contractVersion;
 
-        // Attribution des roles fondateurs a l'administrateur deploiement
-        // En production : ces roles seront distribues a des adresses distinctes
-        // (principle of least privilege) apres le deploiement initial.
-        _grantRole(DEFAULT_ADMIN_ROLE, adresseAdmin);
-        _grantRole(ROLE_ADMIN, adresseAdmin);
-        _grantRole(ROLE_GESTIONNAIRE, adresseAdmin);
-        _grantRole(ROLE_ADMIN_FRAIS, adresseAdmin);
-        _grantRole(ROLE_COMPLIANCE, adresseAdmin);
+        // Founding role assignment to the deployment administrator.
+        // In production: these roles will be distributed to distinct
+        // addresses (principle of least privilege) after initial deployment.
+        _grantRole(DEFAULT_ADMIN_ROLE, adminAddress);
+        _grantRole(ADMIN_ROLE,         adminAddress);
+        _grantRole(MANAGER_ROLE,       adminAddress);
+        _grantRole(FEE_ADMIN_ROLE,     adminAddress);
+        _grantRole(COMPLIANCE_ROLE,    adminAddress);
 
         // -----------------------------------------------------------------------
-        // Parametres de frais par defaut — Fonds monetaire institutionnel
-        // Source : AFG (Association Francaise de la Gestion financiere) 2024
+        // Default fee parameters — institutional money market fund
+        // Source: AFG (Association Francaise de la Gestion financiere) 2024
         // -----------------------------------------------------------------------
-        _frais = StructureFrais({
-            fraisSouscriptionEntrantBp: 0,      // 0 bp : pas de frais d'entree (pratique standard
-                                                 // pour les fonds reserves institutionnels)
-            fraisRachatSortantBp:       0,      // 0 bp : pas de frais de sortie standard
-            fraisGestionAnnuelsBp:      50,     // 0.50%/an : fourchette basse institutionnel
-                                                 // (0.10-0.50% pour un MMF, 1-2% pour un FIA)
-            fraisPerformanceBp:         2_000,  // 20% de la surperformance : standard "2/20"
-                                                 // (2% gestion + 20% perf) du hedge fund classique
-            hurleRate:                  300,    // 3%/an : hurdle rate base sur l'Euribor 3M moyen
-                                                 // Ajustable selon les conditions de marche
-            fraisDepositaireAnnuelsBp:  5,      // 0.05%/an : standard pour grands fonds (> 500M EUR)
-                                                 // BNP Securities Services, Caceis, SGSS
-            fraisAdminAnnuelsBp:        10,     // 0.10%/an : frais administrateur de fonds
-                                                 // (valorisateur, agent de transfert, auditeur)
-            fraisRachatAnticieBp:       200,    // 2% : penalite rachat avant fin de lock-up
-                                                 // Protege les porteurs restants contre la dilution
-            derniereMiseAJour:          block.timestamp
+        _fees = FeeStructure({
+            subscriptionFeeBp:        0,     // 0 bp: no entry fee (standard practice
+                                              // for institutional reserved funds)
+            redemptionFeeBp:          0,     // 0 bp: no standard exit fee
+            annualManagementFeeBp:    50,    // 0.50%/yr: low end of institutional range
+                                              // (0.10-0.50% for an MMF, 1-2% for an AIF)
+            performanceFeeBp:         2_000, // 20% of outperformance: classic hedge
+                                              // fund "2/20" standard (2% mgmt + 20% perf)
+            hurdleRateBp:             300,   // 3%/yr: hurdle rate based on average 3M
+                                              // Euribor. Adjustable with market conditions
+            annualCustodyFeeBp:       5,     // 0.05%/yr: standard for large funds (> 500M EUR)
+                                              // BNP Securities Services, Caceis, SGSS
+            annualAdminFeeBp:         10,    // 0.10%/yr: fund administrator fee
+                                              // (valuation agent, transfer agent, auditor)
+            earlyRedemptionPenaltyBp: 200,   // 2%: penalty for redemption before lock-up ends
+                                              // Protects remaining holders against dilution
+            lastUpdateTimestamp:      block.timestamp
         });
 
         // -----------------------------------------------------------------------
-        // Strategie d'investissement par defaut — MMF court terme
-        // Conforme au Reglement EU 2017/1131 sur les fonds monetaires
+        // Default investment strategy — short-term MMF
+        // Compliant with EU Regulation 2017/1131 on money market funds
         // -----------------------------------------------------------------------
-        _strategie = StrategieInvestissement({
-            allocationBilletsTresorerieBp:  6_000,  // 60% NEU CP : principal instrument MMF francais
-                                                      // Emis par entreprises et collectivites locales
-            allocationObligationsBp:         2_000,  // 20% OAT/BTAN/obligations IG courte duree
-                                                      // Maturite residuelle < 2 ans (risque de taux limite)
-            allocationActionsBp:             0,       // 0% actions : incompatible avec un MMF pur
-                                                      // (Art. 9 Reglement MMF : actifs eligibles seulement)
-            allocationLiquiditesBp:          2_000,  // 20% liquidites : au-dessus du minimum
-                                                      // reglementaire (10%) pour gerer les rachats
-            toleranceDeviationBp:            100,    // 1% : seuil de declenchement du reequilibrage
-                                                      // Compromis entre stabilite et precision d'allocation
-            durationMaxJours:                90,     // 90 jours WAM (Weighted Average Maturity)
-                                                      // Conforme Art. 24 Reglement MMF (WAM <= 60j,
-                                                      // on est conservateur a 90j pour un FIA similaire)
-            ratingMinimumContrepartie:       3,      // AA minimum (code 3 dans notre nomenclature)
-                                                      // Conforme ESMA MMF : pas d'exposition
-                                                      // sous investment grade
-            derniereMiseAJour:               block.timestamp
+        _strategy = InvestmentStrategy({
+            commercialPaperAllocationBp: 6_000, // 60% NEU CP: main French MMF instrument
+                                                 // Issued by corporates and local authorities
+            bondAllocationBp:            2_000, // 20% OAT/BTAN/short-duration IG bonds
+                                                 // Residual maturity < 2 years (limited rate risk)
+            equityAllocationBp:          0,     // 0% equities: incompatible with a pure MMF
+                                                 // (Art. 9 MMF Regulation: eligible assets only)
+            cashAllocationBp:            2_000, // 20% cash: above the regulatory minimum
+                                                 // (10%) to handle redemptions
+            deviationToleranceBp:        100,   // 1%: rebalancing trigger threshold
+                                                 // Trade-off between stability and precision
+            maxDurationDays:             90,    // 90 days WAM (Weighted Average Maturity)
+                                                 // Compliant with MMF Regulation Art. 24
+                                                 // (WAM <= 60d; we are conservative at 90d
+                                                 // for a similar AIF profile)
+            minCounterpartyRating:       3,     // AA minimum (code 3 in our nomenclature)
+                                                 // Compliant with ESMA MMF: no sub-investment
+                                                 // grade exposure
+            lastUpdateTimestamp:         block.timestamp
         });
 
-        // HWM initialise a zero : premier cycle NAV etablira le HWM initial
+        // HWM initialized to zero: the first NAV cycle establishes the initial HWM
         _highWaterMark = HighWaterMark({
-            valeurHauteur: 0,
-            horodatage:    block.timestamp,
-            cycleNAV:      0
+            highValue: 0,
+            timestamp: block.timestamp,
+            navCycle:  0
         });
 
-        // Plafond individuel de souscription par defaut : 10 millions EUR
-        // Evite qu'un seul investisseur represente plus de X% du fonds
-        // (a ajuster selon la taille cible du fonds)
-        _plafondSouscriptionIndividuelEUR = 10_000_000 * PRECISION;
+        // Default individual subscription cap: 10 million EUR
+        // Prevents a single investor from representing more than X% of the
+        // fund (to be adjusted based on the fund's target size).
+        _individualSubscriptionCapEUR = 10_000_000 * PRECISION;
     }
 
     // =========================================================================
-    // MODULE 1 : CALCUL DE DEPRECIATION LINEAIRE — BILLETS DE TRESORERIE
+    // MODULE 1 : LINEAR DEPRECIATION CALCULATION — COMMERCIAL PAPER
     // =========================================================================
-    // Les NEU CP sont emis "en dessous du pair" (au discount).
-    // Exemple : un billet de valeur nominale 1 000 000 EUR, taux 3.50%/an, 90 jours
-    //   -> Prix d'emission = 1 000 000 / (1 + 3.50% × 90/365) = 991 400 EUR (approx)
-    //   -> La valeur du billet croit lineairement de 991 400 EUR vers 1 000 000 EUR
-    //      sur 90 jours.
+    // NEU CP are issued "below par" (at a discount).
+    // Example: an instrument with face value 1,000,000 EUR, rate 3.50%/yr, 90 days
+    //   -> Issuance price = 1,000,000 / (1 + 3.50% x 90/365) = 991,400 EUR (approx.)
+    //   -> The instrument's value rises linearly from 991,400 EUR to
+    //      1,000,000 EUR over 90 days.
     //
-    // Methode choisie : AMORTISSEMENT LINEAIRE (Straight-Line Amortization)
-    //   Formule : V(t) = PrixEmission + (VN - PrixEmission) × (t / T)
-    //   Ou : t = jours ecoules, T = duree totale, VN = valeur nominale
+    // Method chosen: STRAIGHT-LINE AMORTIZATION
+    //   Formula: V(t) = IssuancePrice + (FV - IssuancePrice) x (t / T)
+    //   Where: t = days elapsed, T = total duration, FV = face value
     //
-    // Pourquoi lineaire plutot qu'actuariel (taux compose) ?
-    //   1. La methode actuarielle necessite exp() / pow() non disponibles en Solidity
-    //      sans bibliotheques externes (risque de securite supplementaire).
-    //   2. Pour les maturites courtes (< 1 an, typique NEU CP), l'ecart entre les
-    //      deux methodes est inferieur a 0.01 bp (negligeable).
-    //   3. La methode lineaire est acceptee par les regulateurs pour les MMF
-    //      a valeur liquidative stable ou quasi-stable (CNAV/LVNAV).
-    //   4. Conformite IFRS 9 : les instruments HtM peuvent etre valorises au
-    //      cout amorti lineaire si l'ecart avec la valeur actuarielle est non materiel.
+    // Why straight-line rather than actuarial (compound rate)?
+    //   1. The actuarial method requires exp()/pow(), not available in
+    //      Solidity without external libraries (additional security risk).
+    //   2. For short maturities (< 1 year, typical of NEU CP), the gap
+    //      between the two methods is under 0.01 bp (negligible).
+    //   3. The straight-line method is accepted by regulators for MMFs with
+    //      a stable or quasi-stable NAV (CNAV/LVNAV).
+    //   4. IFRS 9 compliance: held-to-maturity instruments can be valued at
+    //      straight-line amortized cost if the gap with the actuarial value
+    //      is immaterial.
 
-    /// @notice Calcule la valeur actuelle d'un billet de tresorerie (NEU CP) par amortissement lineaire
-    /// @param valeurNominale Valeur nominale (remboursement a maturite) en EUR — 18 decimales
-    /// @param tauxAnnuel Taux de rendement annuel en points de base (ex: 350 = 3.50%/an)
-    /// @param dureeJours Duree totale de l'instrument en jours calendaires
-    /// @param joursEcoules Nombre de jours ecoules depuis la date d'emission
-    /// @return valeurActuelle Valeur actuelle de l'instrument en EUR — 18 decimales
+    /// @notice Computes the current value of a commercial paper (NEU CP) instrument by straight-line amortization
+    /// @param faceValue Face value (repayment at maturity) in EUR — 18 decimals
+    /// @param annualRateBp Annual yield rate in basis points (e.g. 350 = 3.50%/yr)
+    /// @param durationDays Total duration of the instrument in calendar days
+    /// @param daysElapsed Number of days elapsed since the issuance date
+    /// @return currentValue Current value of the instrument in EUR — 18 decimals
     ///
-    /// @dev Invariant garanti : valeurActuelle >= prixEmission ET <= valeurNominale
-    ///      Si joursEcoules >= dureeJours : retourne valeurNominale (maturite atteinte)
-    function calculerDepreciationLineaire(
-        uint256 valeurNominale,
-        uint256 tauxAnnuel,
-        uint256 dureeJours,
-        uint256 joursEcoules
-    ) external pure override returns (uint256 valeurActuelle) {
+    /// @dev Guaranteed invariant: currentValue >= issuancePrice AND <= faceValue
+    ///      If daysElapsed >= durationDays: returns faceValue (maturity reached)
+    function calculateLinearDepreciation(
+        uint256 faceValue,
+        uint256 annualRateBp,
+        uint256 durationDays,
+        uint256 daysElapsed
+    ) external pure override returns (uint256 currentValue) {
         // --- CHECKS ---
-        require(valeurNominale > 0,                     "TOOLBOX: Valeur nominale nulle");
-        require(dureeJours > 0,                         "TOOLBOX: Duree nulle");
-        require(tauxAnnuel > 0,                         "TOOLBOX: Taux annuel nul");
-        require(tauxAnnuel <= BASE_POINTS * 10,         "TOOLBOX: Taux annuel aberrant (> 100%)");
-        // joursEcoules peut etre 0 (premier jour) ou > dureeJours (echu)
+        require(faceValue > 0,                 "TOOLBOX: Face value is zero");
+        require(durationDays > 0,               "TOOLBOX: Duration is zero");
+        require(annualRateBp > 0,               "TOOLBOX: Annual rate is zero");
+        require(annualRateBp <= BASE_POINTS * 10, "TOOLBOX: Annual rate implausible (> 100%)");
+        // daysElapsed may be 0 (first day) or > durationDays (matured)
 
-        // --- CAS : instrument arrive a maturite ou depasse ---
-        // Retourne la valeur nominale : c'est le montant rembourse a l'echeance.
-        if (joursEcoules >= dureeJours) {
-            return valeurNominale;
+        // --- CASE: instrument has reached or passed maturity ---
+        // Returns the face value: the amount repaid at maturity.
+        if (daysElapsed >= durationDays) {
+            return faceValue;
         }
 
-        // --- ETAPE 1 : Calcul du prix d'emission (prix au discount) ---
-        // Formule simple (methode lineaire europeenne ACT/365) :
-        //   PrixEmission = VN / (1 + taux_decimal × duree/365)
-        //   PrixEmission = VN × 365 × BASE_POINTS / (365 × BASE_POINTS + taux × duree)
+        // --- STEP 1: Compute the issuance (discount) price ---
+        // Simple formula (European straight-line ACT/365 method):
+        //   IssuancePrice = FV / (1 + rate_decimal x duration/365)
+        //   IssuancePrice = FV x 365 x BASE_POINTS / (365 x BASE_POINTS + rate x duration)
         //
-        // On utilise Math.mulDiv(a, b, c) = a*b/c sans overflow intermediaire.
-        // numerateur   = VN × (365 × 10000)
-        // denominateur = (365 × 10000) + (taux_bp × duree_jours)
+        // Uses Math.mulDiv(a, b, c) = a*b/c without intermediate overflow.
+        // numerator   = FV x (365 x 10000)
+        // denominator = (365 x 10000) + (rate_bp x duration_days)
         //
-        // Exemple : VN=1e24 (1M EUR × 1e18), taux=350bp, duree=90j
-        //   num = 1e24 × 3650000 = 3.65e30 < 2^256 ? OUI (2^256 ≈ 1.15e77) -> OK
-        //   den = 3650000 + (350 × 90) = 3650000 + 31500 = 3681500
-        //   prixEmission = 3.65e30 / 3681500 ≈ 9.914e23 (991 400 EUR × 1e18)
-        uint256 numerateurPrix = JOURS_PAR_AN * BASE_POINTS;
-        uint256 denominateurPrix = (JOURS_PAR_AN * BASE_POINTS) + (tauxAnnuel * dureeJours);
+        // Example: FV=1e24 (1M EUR x 1e18), rate=350bp, duration=90d
+        //   num = 1e24 x 3650000 = 3.65e30 < 2^256 ? YES (2^256 ~ 1.15e77) -> OK
+        //   den = 3650000 + (350 x 90) = 3650000 + 31500 = 3681500
+        //   issuancePrice = 3.65e30 / 3681500 ~= 9.914e23 (991,400 EUR x 1e18)
+        uint256 priceNumerator = DAYS_PER_YEAR * BASE_POINTS;
+        uint256 priceDenominator = (DAYS_PER_YEAR * BASE_POINTS) + (annualRateBp * durationDays);
 
-        uint256 prixEmission = Math.mulDiv(valeurNominale, numerateurPrix, denominateurPrix);
+        uint256 issuancePrice = Math.mulDiv(faceValue, priceNumerator, priceDenominator);
 
-        // --- ETAPE 2 : Calcul de la decote (discount) ---
-        // La decote est la plus-value totale sur la duree de vie du billet.
-        // Elle sera amortie lineairement au fil du temps.
-        uint256 decote = valeurNominale - prixEmission;
-        // prixEmission <= valeurNominale toujours (taux >= 0), donc pas de underflow
+        // --- STEP 2: Compute the discount ---
+        // The discount is the total gain over the instrument's lifetime.
+        // It will be amortized linearly over time.
+        uint256 discount = faceValue - issuancePrice;
+        // issuancePrice <= faceValue always holds (rate >= 0), so no underflow
 
-        // --- ETAPE 3 : Amortissement lineaire de la decote ---
-        // Portion amortie(t) = decote × (joursEcoules / dureeJours)
-        // En virgule fixe avec Math.mulDiv pour eviter l'overflow :
-        // mulDiv(decote, joursEcoules, dureeJours) = decote × joursEcoules / dureeJours
-        uint256 portionAmortie = Math.mulDiv(decote, joursEcoules, dureeJours);
+        // --- STEP 3: Straight-line amortization of the discount ---
+        // Amortized portion(t) = discount x (daysElapsed / durationDays)
+        // In fixed point with Math.mulDiv to avoid overflow:
+        // mulDiv(discount, daysElapsed, durationDays) = discount x daysElapsed / durationDays
+        uint256 amortizedPortion = Math.mulDiv(discount, daysElapsed, durationDays);
 
-        // --- ETAPE 4 : Valeur actuelle ---
-        valeurActuelle = prixEmission + portionAmortie;
+        // --- STEP 4: Current value ---
+        currentValue = issuancePrice + amortizedPortion;
 
-        // Invariant de securite (ne devrait jamais echouer mathematiquement,
-        // mais on le verifie par assertion pour detecter tout bug de calcul)
-        assert(valeurActuelle <= valeurNominale);
-        assert(valeurActuelle >= prixEmission);
+        // Safety invariant (should never fail mathematically, but is
+        // asserted to catch any calculation bug)
+        assert(currentValue <= faceValue);
+        assert(currentValue >= issuancePrice);
 
-        return valeurActuelle;
+        return currentValue;
     }
 
-    /// @notice Calcule un resultat de valorisation detaille pour un billet enregistre
-    /// @param identifiant ISIN du billet de tresorerie
-    /// @return resultat Structure complete avec valeur actuelle, interets courus, etc.
+    /// @notice Computes a detailed valuation result for a registered commercial paper instrument
+    /// @param identifier ISIN of the commercial paper instrument
+    /// @return result Complete structure with current value, accrued interest, etc.
     ///
-    /// @dev Fonction view : peut etre appelee gratuitement en lecture seule.
-    /// Utilisee par le valorisateur pour soumettre les prix au Fund.
-    function calculerValorisationBillet(bytes32 identifiant)
+    /// @dev View function: can be called for free, read-only.
+    /// Used by the valuation agent to submit prices to the Fund.
+    function calculateCommercialPaperValuation(bytes32 identifier)
         external
         view
-        returns (ResultatValorisation memory resultat)
+        returns (ValuationResult memory result)
     {
-        ParametresBilletTresorerie storage billet = _billetsTresorerie[identifiant];
-        require(billet.estActif, "TOOLBOX: Billet de tresorerie inconnu ou inactif");
+        CommercialPaperParameters storage paper = _commercialPapers[identifier];
+        require(paper.isActive, "TOOLBOX: Unknown or inactive commercial paper");
 
-        uint256 maintenant = block.timestamp;
+        uint256 nowTimestamp = block.timestamp;
 
-        // Calcul du nombre de jours ecoules depuis l'emission
-        // On utilise la division entiere (1 day = 86400 secondes)
-        uint256 secondesEcoulees = maintenant > billet.dateEmission
-            ? maintenant - billet.dateEmission
+        // Number of days elapsed since issuance.
+        // Uses integer division (1 day = 86400 seconds)
+        uint256 secondsElapsed = nowTimestamp > paper.issuanceDate
+            ? nowTimestamp - paper.issuanceDate
             : 0;
-        uint256 joursEcoules = secondesEcoulees / 1 days;
+        uint256 daysElapsed = secondsElapsed / 1 days;
 
-        bool estEchu = maintenant >= billet.dateMaturite;
+        bool isMatured = nowTimestamp >= paper.maturityDate;
 
-        // Calcul de la valeur actuelle
-        uint256 valActuelle;
-        if (estEchu) {
-            // A maturite : valeur = valeur nominale (remboursement par l'emetteur)
-            valActuelle = billet.valeurNominale;
+        // Current value calculation
+        uint256 currentVal;
+        if (isMatured) {
+            // At maturity: value = face value (issuer repayment)
+            currentVal = paper.faceValue;
         } else {
-            // Appel recursif a notre propre fonction de depreciation
-            valActuelle = this.calculerDepreciationLineaire(
-                billet.valeurNominale,
-                billet.tauxRendementBp,
-                billet.dureeJours,
-                joursEcoules
+            // Recursive call to our own depreciation function
+            currentVal = this.calculateLinearDepreciation(
+                paper.faceValue,
+                paper.yieldRateBp,
+                paper.durationDays,
+                daysElapsed
             );
         }
 
-        // Interets courus = valeur actuelle - prix d'acquisition
-        // Mesure le gain non realise sur la position
-        uint256 interetsCourus = valActuelle > billet.prixAcquisition
-            ? valActuelle - billet.prixAcquisition
+        // Accrued interest = current value - acquisition price
+        // Measures the unrealized gain on the position
+        uint256 accruedInterest = currentVal > paper.acquisitionPrice
+            ? currentVal - paper.acquisitionPrice
             : 0;
 
-        // Rendement journalier en unites PRECISION
-        // = (taux annuel en bp / BASE_POINTS) / JOURS_PAR_AN
-        // = taux × PRECISION / (BASE_POINTS × JOURS_PAR_AN)
-        uint256 rendementJournalier = Math.mulDiv(
-            billet.tauxRendementBp * PRECISION,
+        // Daily yield, in PRECISION units
+        // = (annual rate bp / BASE_POINTS) / DAYS_PER_YEAR
+        // = rate x PRECISION / (BASE_POINTS x DAYS_PER_YEAR)
+        uint256 dailyYield = Math.mulDiv(
+            paper.yieldRateBp * PRECISION,
             1,
-            BASE_POINTS * JOURS_PAR_AN
+            BASE_POINTS * DAYS_PER_YEAR
         );
 
-        uint256 joursRestants = estEchu
+        uint256 daysRemaining = isMatured
             ? 0
-            : (billet.dateMaturite - maintenant) / 1 days;
+            : (paper.maturityDate - nowTimestamp) / 1 days;
 
-        resultat = ResultatValorisation({
-            valeurActuelle:      valActuelle,
-            interetsCourus:      interetsCourus,
-            joursEcoules:        joursEcoules,
-            joursRestants:       joursRestants,
-            rendementJournalier: rendementJournalier,
-            estEchu:             estEchu
+        result = ValuationResult({
+            currentValue:    currentVal,
+            accruedInterest: accruedInterest,
+            daysElapsed:     daysElapsed,
+            daysRemaining:   daysRemaining,
+            dailyYield:      dailyYield,
+            isMatured:       isMatured
         });
     }
 
     // =========================================================================
-    // MODULE 2 : CALCUL DES FRAIS
+    // MODULE 2 : FEE CALCULATION
     // =========================================================================
 
-    /// @notice Calcule les frais de transaction pour une souscription ou un rachat
-    /// @param montant Montant brut de l'operation en EUR (18 decimales)
-    /// @param typeOperation 0 = souscription, 1 = rachat
-    /// @return frais Montant total des frais a prelever en EUR (18 decimales)
+    /// @notice Computes transaction fees for a subscription or redemption
+    /// @param amount Gross amount of the operation in EUR (18 decimals)
+    /// @param operationType 0 = subscription, 1 = redemption
+    /// @return fee Total fee to charge, in EUR (18 decimals)
     ///
-    /// @dev Fonction view : lecture seule de la structure de frais.
-    /// Utilise Math.mulDiv pour la precision sur les grands montants :
-    ///   frais = montant × tauxBp / BASE_POINTS
-    ///   mulDiv evite que (montant × tauxBp) ne depasse uint256 avant la division.
-    function calculerFrais(
-        uint256 montant,
-        uint8 typeOperation
-    ) external view override returns (uint256 frais) {
-        require(montant > 0,           "TOOLBOX: Montant nul pour calcul de frais");
-        require(typeOperation <= 1,    "TOOLBOX: Type d'operation invalide (0=souscription, 1=rachat)");
+    /// @dev View function: read-only access to the fee structure.
+    /// Uses Math.mulDiv for precision on large amounts:
+    ///   fee = amount x rateBp / BASE_POINTS
+    ///   mulDiv prevents (amount x rateBp) from exceeding uint256 before division.
+    function calculateFees(
+        uint256 amount,
+        uint8 operationType
+    ) external view override returns (uint256 fee) {
+        require(amount > 0,          "TOOLBOX: Zero amount for fee calculation");
+        require(operationType <= 1,  "TOOLBOX: Invalid operation type (0=subscription, 1=redemption)");
 
-        if (typeOperation == 0) {
-            // --- SOUSCRIPTION : frais d'entree ---
-            // Frais = montant × fraisSouscriptionEntrantBp / 10 000
-            frais = Math.mulDiv(montant, _frais.fraisSouscriptionEntrantBp, BASE_POINTS);
+        if (operationType == 0) {
+            // --- SUBSCRIPTION: entry fee ---
+            // Fee = amount x subscriptionFeeBp / 10,000
+            fee = Math.mulDiv(amount, _fees.subscriptionFeeBp, BASE_POINTS);
         } else {
-            // --- RACHAT STANDARD : frais de sortie ---
-            frais = Math.mulDiv(montant, _frais.fraisRachatSortantBp, BASE_POINTS);
+            // --- STANDARD REDEMPTION: exit fee ---
+            fee = Math.mulDiv(amount, _fees.redemptionFeeBp, BASE_POINTS);
         }
 
-        return frais;
+        return fee;
     }
 
-    /// @notice Calcule les frais de rachat avec distinction standard / anticipe
-    /// @param montant Montant du rachat en EUR
-    /// @param investisseur Adresse de l'investisseur (pour verifier le lock-up)
-    /// @return frais Frais totaux (standard ou majores si rachat anticipe)
-    /// @return estAnticipe True si le rachat est avant la fin du lock-up
-    function calculerFraisRachatComplets(
-        uint256 montant,
-        address investisseur
-    ) external view returns (uint256 frais, bool estAnticipe) {
-        require(montant > 0, "TOOLBOX: Montant nul");
-        require(investisseur != address(0), "TOOLBOX: Adresse invalide");
+    /// @notice Computes redemption fees, distinguishing standard vs early redemption
+    /// @param amount Redemption amount in EUR
+    /// @param firstEntryTimestamp Investor's first-entry timestamp, as read by
+    ///   the caller from TokenizedISIN.getShareholderRecord(investor).firstEntryTimestamp
+    ///   (0 if the investor has never subscribed, i.e. lock-up not applicable).
+    /// @return fee Total fee (standard or increased for an early redemption)
+    /// @return isEarly True if the redemption occurs before the end of the lock-up
+    function calculateFullRedemptionFees(
+        uint256 amount,
+        uint256 firstEntryTimestamp
+    ) external view returns (uint256 fee, bool isEarly) {
+        require(amount > 0, "TOOLBOX: Zero amount");
 
-        uint256 dateEntree = _datePremiereEntree[investisseur];
-        estAnticipe = (dateEntree > 0 && block.timestamp < dateEntree + PERIODE_LOCK_UP);
+        isEarly = (firstEntryTimestamp > 0 && block.timestamp < firstEntryTimestamp + LOCK_UP_PERIOD);
 
-        if (estAnticipe) {
-            // Rachat anticipe : penalite additionnelle sur la totalite du montant
-            frais = Math.mulDiv(montant, _frais.fraisRachatAnticieBp, BASE_POINTS);
+        if (isEarly) {
+            // Early redemption: additional penalty on the full amount
+            fee = Math.mulDiv(amount, _fees.earlyRedemptionPenaltyBp, BASE_POINTS);
         } else {
-            // Rachat standard : frais de sortie normaux
-            frais = Math.mulDiv(montant, _frais.fraisRachatSortantBp, BASE_POINTS);
+            // Standard redemption: normal exit fee
+            fee = Math.mulDiv(amount, _fees.redemptionFeeBp, BASE_POINTS);
         }
     }
 
-    /// @notice Calcule les frais de gestion courants prorata temporis pour un cycle NAV
-    /// @param actifNetTotal Actif net total du fonds en EUR (18 decimales)
-    /// @param dureeSecondesCycle Duree du cycle NAV en secondes
-    /// @return fraisGestion Frais de gestion prorata en EUR
-    /// @return fraisDepositaire Frais depositaire prorata en EUR
-    /// @return fraisAdmin Frais administratifs prorata en EUR
+    /// @notice Computes prorata temporis ongoing management fees for a NAV cycle
+    /// @param totalNetAssets Total net assets of the fund in EUR (18 decimals)
+    /// @param cycleDurationSeconds Duration of the NAV cycle in seconds
+    /// @return managementFee Prorata management fee in EUR
+    /// @return custodyFee Prorata custody fee in EUR
+    /// @return adminFee Prorata admin fee in EUR
     ///
-    /// @dev Formule prorata : frais = ANT × (taux_annuel / 10000) × (duree / secondes_par_an)
-    ///   On decompose en deux mulDiv imbriques pour eviter l'overflow :
-    ///   Etape 1 : fraisAnnuels = mulDiv(ANT, taux_bp, BASE_POINTS)
-    ///   Etape 2 : fraisProrata = mulDiv(fraisAnnuels, dureeSecondes, SECONDES_PAR_AN)
-    function calculerFraisCourantsProrata(
-        uint256 actifNetTotal,
-        uint256 dureeSecondesCycle
+    /// @dev Prorata formula: fee = NetAssets x (annualRate / 10000) x (duration / secondsPerYear)
+    ///   Decomposed into two nested mulDiv calls to avoid overflow:
+    ///   Step 1: annualFee = mulDiv(NetAssets, rateBp, BASE_POINTS)
+    ///   Step 2: prorataFee = mulDiv(annualFee, durationSeconds, SECONDS_PER_YEAR)
+    function calculateProrataOngoingFees(
+        uint256 totalNetAssets,
+        uint256 cycleDurationSeconds
     )
         external
         view
         returns (
-            uint256 fraisGestion,
-            uint256 fraisDepositaire,
-            uint256 fraisAdmin
+            uint256 managementFee,
+            uint256 custodyFee,
+            uint256 adminFee
         )
     {
-        require(actifNetTotal > 0,           "TOOLBOX: ANT nul");
-        require(dureeSecondesCycle > 0,      "TOOLBOX: Duree de cycle nulle");
-        require(dureeSecondesCycle <= 7 days, "TOOLBOX: Duree de cycle excessive (> 7 jours)");
+        require(totalNetAssets > 0,             "TOOLBOX: Zero net assets");
+        require(cycleDurationSeconds > 0,        "TOOLBOX: Zero cycle duration");
+        require(cycleDurationSeconds <= 7 days,  "TOOLBOX: Excessive cycle duration (> 7 days)");
 
-        // Frais de gestion = ANT × tauxGestion/10000 × duree/365j
-        fraisGestion = Math.mulDiv(
-            Math.mulDiv(actifNetTotal, _frais.fraisGestionAnnuelsBp, BASE_POINTS),
-            dureeSecondesCycle,
-            SECONDES_PAR_AN
+        // Management fee = NetAssets x managementRate/10000 x duration/365d
+        managementFee = Math.mulDiv(
+            Math.mulDiv(totalNetAssets, _fees.annualManagementFeeBp, BASE_POINTS),
+            cycleDurationSeconds,
+            SECONDS_PER_YEAR
         );
 
-        // Frais depositaire = ANT × tauxDepositaire/10000 × duree/365j
-        fraisDepositaire = Math.mulDiv(
-            Math.mulDiv(actifNetTotal, _frais.fraisDepositaireAnnuelsBp, BASE_POINTS),
-            dureeSecondesCycle,
-            SECONDES_PAR_AN
+        // Custody fee = NetAssets x custodyRate/10000 x duration/365d
+        custodyFee = Math.mulDiv(
+            Math.mulDiv(totalNetAssets, _fees.annualCustodyFeeBp, BASE_POINTS),
+            cycleDurationSeconds,
+            SECONDS_PER_YEAR
         );
 
-        // Frais administratifs = ANT × tauxAdmin/10000 × duree/365j
-        fraisAdmin = Math.mulDiv(
-            Math.mulDiv(actifNetTotal, _frais.fraisAdminAnnuelsBp, BASE_POINTS),
-            dureeSecondesCycle,
-            SECONDES_PAR_AN
+        // Admin fee = NetAssets x adminRate/10000 x duration/365d
+        adminFee = Math.mulDiv(
+            Math.mulDiv(totalNetAssets, _fees.annualAdminFeeBp, BASE_POINTS),
+            cycleDurationSeconds,
+            SECONDS_PER_YEAR
         );
     }
 
-    /// @notice Calcule les frais de performance selon le mecanisme High Water Mark
-    /// @param navParPartActuelle NAV par part actuelle en EUR (18 decimales)
-    /// @param nombrePartsTotales Nombre de parts en circulation
-    /// @return fraisPerformance Frais de performance en EUR (0 si en-dessous du HWM ou hurdle)
+    /// @notice Computes performance fees under the High Water Mark mechanism
+    /// @param currentNAVPerShare Current NAV per share in EUR (18 decimals)
+    /// @param totalSharesOutstanding Total shares outstanding
+    /// @return performanceFee Performance fee in EUR (0 if below HWM or hurdle)
     ///
-    /// @dev Algorithme HWM + hurdle rate :
-    ///   1. Si NAV <= HWM : aucun frais de perf (on n'est pas au-dessus du plus haut)
-    ///   2. Calcul du hurdle depuis le dernier HWM : hurdleParPart = HWM × taux × temps
-    ///   3. Si NAV <= HWM + hurdle : aucun frais (la hausse est insuffisante)
-    ///   4. Sinon : fraisPerf = (NAV - HWM - hurdle) × nombreParts × tauxPerf / BASE_POINTS
-    function calculerFraisPerformance(
-        uint256 navParPartActuelle,
-        uint256 nombrePartsTotales
-    ) external view returns (uint256 fraisPerformance) {
-        // Aucun calcul si aucune part en circulation
-        if (nombrePartsTotales == 0) return 0;
+    /// @dev HWM + hurdle rate algorithm:
+    ///   1. If NAV <= HWM: no performance fee (not above the historical high)
+    ///   2. Compute the hurdle accrued since the last HWM: hurdlePerShare = HWM x rate x time
+    ///   3. If NAV <= HWM + hurdle: no fee (the rise is insufficient)
+    ///   4. Otherwise: performanceFee = (NAV - HWM - hurdle) x shares x perfRate / BASE_POINTS
+    function calculatePerformanceFees(
+        uint256 currentNAVPerShare,
+        uint256 totalSharesOutstanding
+    ) external view returns (uint256 performanceFee) {
+        // No calculation if no shares are outstanding
+        if (totalSharesOutstanding == 0) return 0;
 
-        // Si NAV actuelle <= HWM : pas de frais de performance
-        if (navParPartActuelle <= _highWaterMark.valeurHauteur) return 0;
+        // If current NAV <= HWM: no performance fee
+        if (currentNAVPerShare <= _highWaterMark.highValue) return 0;
 
-        // Calcul du hurdle rate accumule depuis l'etablissement du dernier HWM
-        // hurdleParPart = HWM × (hurleRate/10000) × (temps_ecoule / secondes_par_an)
-        uint256 tempsDepuisHWM = block.timestamp > _highWaterMark.horodatage
-            ? block.timestamp - _highWaterMark.horodatage
+        // Compute the hurdle rate accrued since the last HWM was established
+        // hurdlePerShare = HWM x (hurdleRateBp/10000) x (timeElapsed / secondsPerYear)
+        uint256 timeSinceHWM = block.timestamp > _highWaterMark.timestamp
+            ? block.timestamp - _highWaterMark.timestamp
             : 0;
 
-        uint256 hurdleParPart = Math.mulDiv(
-            Math.mulDiv(_highWaterMark.valeurHauteur, _frais.hurleRate, BASE_POINTS),
-            tempsDepuisHWM,
-            SECONDES_PAR_AN
+        uint256 hurdlePerShare = Math.mulDiv(
+            Math.mulDiv(_highWaterMark.highValue, _fees.hurdleRateBp, BASE_POINTS),
+            timeSinceHWM,
+            SECONDS_PER_YEAR
         );
 
-        // Seuil minimum de performance : HWM + hurdle accumule
-        uint256 navMinimumRequis = _highWaterMark.valeurHauteur + hurdleParPart;
+        // Minimum required NAV threshold: HWM + accrued hurdle
+        uint256 minimumRequiredNAV = _highWaterMark.highValue + hurdlePerShare;
 
-        // Si la NAV n'atteint pas le minimum requis : pas de frais
-        if (navParPartActuelle <= navMinimumRequis) return 0;
+        // If NAV does not reach the required minimum: no fee
+        if (currentNAVPerShare <= minimumRequiredNAV) return 0;
 
-        // Surperformance par part = NAV actuelle - (HWM + hurdle)
-        uint256 surperformanceParPart = navParPartActuelle - navMinimumRequis;
+        // Outperformance per share = current NAV - (HWM + hurdle)
+        uint256 outperformancePerShare = currentNAVPerShare - minimumRequiredNAV;
 
-        // Frais de perf = surperf × nbParts × tauxPerf / BASE_POINTS
-        // Decompose en deux mulDiv pour eviter l'overflow :
-        // Etape 1 : valeurSurperformanceTotale = (surperf × nbParts) / PRECISION
-        //   (division par PRECISION car surperf et nbParts sont en 18 dec)
-        // Etape 2 : fraisPerf = valeurSurperfTotale × tauxBp / BASE_POINTS
-        uint256 valeurSurperfTotale = Math.mulDiv(
-            surperformanceParPart,
-            nombrePartsTotales,
+        // Performance fee = outperformance x shares x perfRate / BASE_POINTS
+        // Decomposed into two mulDiv calls to avoid overflow:
+        // Step 1: totalOutperformanceValue = (outperformance x shares) / PRECISION
+        //   (divided by PRECISION because outperformance and shares are 18 dec)
+        // Step 2: performanceFee = totalOutperformanceValue x rateBp / BASE_POINTS
+        uint256 totalOutperformanceValue = Math.mulDiv(
+            outperformancePerShare,
+            totalSharesOutstanding,
             PRECISION
         );
 
-        fraisPerformance = Math.mulDiv(valeurSurperfTotale, _frais.fraisPerformanceBp, BASE_POINTS);
+        performanceFee = Math.mulDiv(totalOutperformanceValue, _fees.performanceFeeBp, BASE_POINTS);
 
-        return fraisPerformance;
+        return performanceFee;
     }
 
-    /// @notice Met a jour le High Water Mark si la NAV actuelle etablit un nouveau plus haut
-    /// @param navParPartActuelle NAV par part actuelle
-    /// @param cycleNAV Numero du cycle NAV courant
-    /// @dev Seul le contrat Fund autorise peut appeler cette fonction (pattern seulementFondAutorise)
-    function mettreAJourHighWaterMark(
-        uint256 navParPartActuelle,
-        uint256 cycleNAV
-    ) external seulementFondAutorise {
-        if (navParPartActuelle > _highWaterMark.valeurHauteur) {
-            uint256 ancienneValeur = _highWaterMark.valeurHauteur;
+    /// @notice Updates the High Water Mark if the current NAV establishes a new historical high
+    /// @param currentNAVPerShare Current NAV per share
+    /// @param navCycle Current NAV cycle number
+    /// @dev Only the authorized Fund contract may call this function (onlyAuthorizedFund pattern)
+    function updateHighWaterMark(
+        uint256 currentNAVPerShare,
+        uint256 navCycle
+    ) external onlyAuthorizedFund {
+        if (currentNAVPerShare > _highWaterMark.highValue) {
+            uint256 previousValue = _highWaterMark.highValue;
 
             _highWaterMark = HighWaterMark({
-                valeurHauteur: navParPartActuelle,
-                horodatage:    block.timestamp,
-                cycleNAV:      cycleNAV
+                highValue: currentNAVPerShare,
+                timestamp: block.timestamp,
+                navCycle:  navCycle
             });
 
-            emit HighWaterMarkMisAJour(
-                ancienneValeur,
-                navParPartActuelle,
-                cycleNAV,
+            emit HighWaterMarkUpdated(
+                previousValue,
+                currentNAVPerShare,
+                navCycle,
                 block.timestamp
             );
         }
     }
 
     // =========================================================================
-    // MODULE 3 : STRATEGIE D'INVESTISSEMENT ET REEQUILIBRAGE DU PORTEFEUILLE
+    // MODULE 3 : INVESTMENT STRATEGY AND PORTFOLIO REBALANCING
     // =========================================================================
 
-    /// @notice Calcule les ajustements de portefeuille necessaires pour atteindre les cibles
-    /// @param valeurTotalePortefeuille Valeur totale actuelle en EUR (18 decimales)
-    /// @param allocationsActuelles Valeurs actuelles par actif en EUR (tableau, 18 dec)
-    /// @param allocationsCibles Allocations cibles par actif en bp (tableau)
-    /// @return ajustements Ajustements a effectuer en EUR (signes : + = achat, - = vente)
+    /// @notice Computes the portfolio adjustments needed to reach target allocations
+    /// @param totalPortfolioValue Current total portfolio value in EUR (18 decimals)
+    /// @param currentAllocations Current per-asset values in EUR (array, 18 dec)
+    /// @param targetAllocations Target per-asset allocations in bp (array)
+    /// @return adjustments Adjustments to make in EUR (signed: + = buy, - = sell)
     ///
-    /// @dev Algorithme de reequilibrage proportionnel :
-    ///   Pour chaque actif i :
-    ///     valeurCible(i) = valeurTotale × allocationCible(i) / BASE_POINTS
-    ///     ajustement(i) = valeurCible(i) - valeurActuelle(i)
-    ///   Propriete : sum(ajustements) ≈ 0 (budget equilibre, ecart max = arrondi)
-    ///   Les ajustements positifs = ordres d'achat a transmettre au depositaire
-    ///   Les ajustements negatifs = ordres de vente a transmettre au depositaire
+    /// @dev Proportional rebalancing algorithm:
+    ///   For each asset i:
+    ///     targetValue(i) = totalValue x targetAllocation(i) / BASE_POINTS
+    ///     adjustment(i) = targetValue(i) - currentValue(i)
+    ///   Property: sum(adjustments) ~= 0 (balanced budget, max gap = rounding)
+    ///   Positive adjustments = buy orders to route to the custodian
+    ///   Negative adjustments = sell orders to route to the custodian
     ///
-    /// @dev La fonction est pure (pas d'acces au storage) : elle peut etre appelee
-    ///   de n'importe quel contexte, y compris par TokenizedAsset et Holding.
-    function calculerAjustementsPortefeuille(
-        uint256 valeurTotalePortefeuille,
-        uint256[] calldata allocationsActuelles,
-        uint256[] calldata allocationsCibles
-    ) external pure override returns (int256[] memory ajustements) {
+    /// @dev The function is pure (no storage access): it can be called from
+    ///   any context, including by satellite contracts.
+    function calculatePortfolioAdjustments(
+        uint256 totalPortfolioValue,
+        uint256[] calldata currentAllocations,
+        uint256[] calldata targetAllocations
+    ) external pure override returns (int256[] memory adjustments) {
         // --- CHECKS ---
-        require(valeurTotalePortefeuille > 0, "TOOLBOX: Valeur totale portefeuille nulle");
+        require(totalPortfolioValue > 0, "TOOLBOX: Zero total portfolio value");
         require(
-            allocationsActuelles.length == allocationsCibles.length,
-            "TOOLBOX: Tableaux d'allocations de tailles differentes"
+            currentAllocations.length == targetAllocations.length,
+            "TOOLBOX: Allocation arrays have different lengths"
         );
         require(
-            allocationsActuelles.length > 0,
-            "TOOLBOX: Portefeuille vide"
+            currentAllocations.length > 0,
+            "TOOLBOX: Empty portfolio"
         );
         require(
-            allocationsActuelles.length <= MAX_ACTIFS_PORTEFEUILLE,
-            "TOOLBOX: Nombre d'actifs depasse le maximum autorise (50)"
+            currentAllocations.length <= MAX_PORTFOLIO_ASSETS,
+            "TOOLBOX: Number of assets exceeds the allowed maximum (50)"
         );
 
-        uint256 nombreActifs = allocationsActuelles.length;
-        ajustements = new int256[](nombreActifs);
+        uint256 assetCount = currentAllocations.length;
+        adjustments = new int256[](assetCount);
 
-        // Verification que les allocations cibles totalisent bien 100% (+/- 1 bp)
-        uint256 totalCibles = 0;
-        for (uint256 i = 0; i < nombreActifs; i++) {
-            totalCibles += allocationsCibles[i];
+        // Verify that target allocations sum to 100% (+/- 1 bp)
+        uint256 totalTargets = 0;
+        for (uint256 i = 0; i < assetCount; i++) {
+            totalTargets += targetAllocations[i];
         }
         require(
-            totalCibles >= BASE_POINTS - 1 && totalCibles <= BASE_POINTS + 1,
-            "TOOLBOX: Allocations cibles ne totalisent pas 100% (+/- 1bp tolere)"
+            totalTargets >= BASE_POINTS - 1 && totalTargets <= BASE_POINTS + 1,
+            "TOOLBOX: Target allocations do not sum to 100% (+/- 1bp tolerance)"
         );
 
-        // --- CALCUL DES AJUSTEMENTS ---
-        for (uint256 i = 0; i < nombreActifs; i++) {
-            // Valeur cible = valeur totale portefeuille × allocation cible (bp) / 10 000
-            // On utilise mulDiv pour eviter l'overflow sur les grands portefeuilles
-            uint256 valeurCible = Math.mulDiv(
-                valeurTotalePortefeuille,
-                allocationsCibles[i],
+        // --- ADJUSTMENT CALCULATION ---
+        for (uint256 i = 0; i < assetCount; i++) {
+            // Target value = total portfolio value x target allocation (bp) / 10,000
+            // Uses mulDiv to avoid overflow on large portfolios
+            uint256 targetValue = Math.mulDiv(
+                totalPortfolioValue,
+                targetAllocations[i],
                 BASE_POINTS
             );
 
-            // Ajustement = cible - actuelle (signe : positif = achat, negatif = vente)
-            // SafeCast.toInt256() leve une exception si la valeur depasse type(int256).max
-            // Protection contre les portefeuilles de taille aberrante
-            int256 cibleSignee   = valeurCible.toInt256();
-            int256 actuelleSignee = allocationsActuelles[i].toInt256();
-            ajustements[i] = cibleSignee - actuelleSignee;
+            // Adjustment = target - current (sign: positive = buy, negative = sell)
+            // SafeCast.toInt256() reverts if the value exceeds type(int256).max
+            // Protection against implausibly large portfolios
+            int256 signedTarget  = targetValue.toInt256();
+            int256 signedCurrent = currentAllocations[i].toInt256();
+            adjustments[i] = signedTarget - signedCurrent;
         }
 
-        return ajustements;
+        return adjustments;
     }
 
-    /// @notice Verifie si le reequilibrage est necessaire selon la tolerance configuree
-    /// @param allocationsActuelles Valeurs actuelles par actif en EUR
-    /// @param allocationsCibles Allocations cibles en bp
-    /// @param valeurTotale Valeur totale du portefeuille en EUR
-    /// @return necessaire True si au moins un actif depasse le seuil de tolerance
-    /// @return indexActifHorsTolerance Index du premier actif hors tolerance (-1 si aucun)
-    function verifierNecessiteReequilibrage(
-        uint256[] calldata allocationsActuelles,
-        uint256[] calldata allocationsCibles,
-        uint256 valeurTotale
-    ) external view returns (bool necessaire, int256 indexActifHorsTolerance) {
-        require(allocationsActuelles.length == allocationsCibles.length, "TOOLBOX: Tableaux de tailles differentes");
-        require(valeurTotale > 0, "TOOLBOX: Valeur totale nulle");
+    /// @notice Checks whether rebalancing is needed given the configured tolerance
+    /// @param currentAllocations Current per-asset values in EUR
+    /// @param targetAllocations Target allocations in bp
+    /// @param totalValue Total portfolio value in EUR
+    /// @return needed True if at least one asset exceeds the tolerance threshold
+    /// @return outOfToleranceIndex Index of the first out-of-tolerance asset (-1 if none)
+    function checkRebalancingNeeded(
+        uint256[] calldata currentAllocations,
+        uint256[] calldata targetAllocations,
+        uint256 totalValue
+    ) external view returns (bool needed, int256 outOfToleranceIndex) {
+        require(currentAllocations.length == targetAllocations.length, "TOOLBOX: Arrays have different lengths");
+        require(totalValue > 0, "TOOLBOX: Zero total value");
 
-        indexActifHorsTolerance = -1; // -1 = aucun actif hors tolerance
+        outOfToleranceIndex = -1; // -1 = no out-of-tolerance asset
 
-        for (uint256 i = 0; i < allocationsActuelles.length; i++) {
-            // Allocation actuelle en bp = (valeurActuelle / valeurTotale) × 10 000
-            uint256 allocationActuelleBp = Math.mulDiv(
-                allocationsActuelles[i],
+        for (uint256 i = 0; i < currentAllocations.length; i++) {
+            // Current allocation in bp = (currentValue / totalValue) x 10,000
+            uint256 currentAllocationBp = Math.mulDiv(
+                currentAllocations[i],
                 BASE_POINTS,
-                valeurTotale
+                totalValue
             );
 
-            // Deviation absolue en bp entre allocation actuelle et cible
+            // Absolute deviation in bp between current and target allocation
             uint256 deviation;
-            if (allocationActuelleBp > allocationsCibles[i]) {
-                deviation = allocationActuelleBp - allocationsCibles[i];
+            if (currentAllocationBp > targetAllocations[i]) {
+                deviation = currentAllocationBp - targetAllocations[i];
             } else {
-                deviation = allocationsCibles[i] - allocationActuelleBp;
+                deviation = targetAllocations[i] - currentAllocationBp;
             }
 
-            // Si la deviation depasse la tolerance : reequilibrage necessaire
-            if (deviation > _strategie.toleranceDeviationBp) {
+            // If the deviation exceeds the tolerance: rebalancing is needed
+            if (deviation > _strategy.deviationToleranceBp) {
                 return (true, i.toInt256());
             }
         }
@@ -998,659 +1050,606 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     }
 
     // =========================================================================
-    // MODULE 4 : VALIDATION DE CONFORMITE REGLEMENTAIRE
+    // MODULE 4 : REGULATORY COMPLIANCE VALIDATION
     // =========================================================================
 
-    /// @notice Valide la conformite d'une operation aux regles du fonds
-    /// @param investisseur Adresse de l'investisseur
-    /// @param montant Montant en EUR (souscription) ou nombre de parts (rachat)
-    /// @param typeOperation 0 = souscription, 1 = rachat
-    /// @return estValide True si toutes les regles sont respectees
+    /// @notice Validates the compliance of an operation against fund rules
+    /// @param investor Investor address
+    /// @param amount Amount in EUR (subscription) or number of shares (redemption)
+    /// @param operationType 0 = subscription, 1 = redemption
+    /// @param amountAlreadyInvested Cumulative amount already invested by
+    ///   `investor`, as read by the caller from
+    ///   TokenizedISIN.getShareholderRecord(investor).amountInvested.
+    ///   Ignored for redemptions.
+    /// @return isValid True if all rules are respected
     ///
-    /// @dev Regles verifiees :
-    ///   SOUSCRIPTION :
-    ///     [1] Montant >= SOUSCRIPTION_MINIMUM (100 000 EUR)
-    ///     [2] Montant cumule + montant <= plafond individuel (10M EUR par defaut)
-    ///   RACHAT :
-    ///     [1] Montant > 0
-    ///     [2] Si avant lock-up : alerte non-bloquante, penalite sera appliquee
+    /// @dev Rules checked:
+    ///   SUBSCRIPTION:
+    ///     [1] Amount >= MINIMUM_SUBSCRIPTION (100,000 EUR)
+    ///     [2] amountAlreadyInvested + amount <= individual cap (10M EUR by default)
+    ///   REDEMPTION:
+    ///     [1] Amount > 0
+    ///     [2] If before lock-up: non-blocking, a penalty will be applied
     ///
-    ///   Note : le whitelisting KYC/AML est gere dans FondTokenise (ROLE_COMPLIANCE).
-    ///   Le Toolbox valide les criteres financiers et reglementaires complementaires.
-    function validerConformite(
-        address investisseur,
-        uint256 montant,
-        uint8 typeOperation
-    ) external view override returns (bool estValide) {
-        // Validations communes de base
-        if (investisseur == address(0)) return false;
-        if (montant == 0) return false;
-        if (typeOperation > 1) return false;
+    ///   Note: KYC/AML whitelisting is handled by TokenizedISIN
+    ///   (COMPLIANCE_ROLE / FUND_ROLE). The Toolbox validates the
+    ///   complementary financial and regulatory criteria.
+    function validateCompliance(
+        address investor,
+        uint256 amount,
+        uint8 operationType,
+        uint256 amountAlreadyInvested
+    ) external view override returns (bool isValid) {
+        // Common baseline validations
+        if (investor == address(0)) return false;
+        if (amount == 0) return false;
+        if (operationType > 1) return false;
 
-        if (typeOperation == 0) {
-            // --- SOUSCRIPTION ---
+        if (operationType == 0) {
+            // --- SUBSCRIPTION ---
 
-            // Regle [1] : Montant minimum institutionnel
-            if (montant < SOUSCRIPTION_MINIMUM) {
-                // Note : on ne peut pas emettre d'event depuis une fonction view.
-                // Le monitoring off-chain detecte le rejet via le retour false.
+            // Rule [1]: Institutional minimum amount
+            if (amount < MINIMUM_SUBSCRIPTION) {
+                // Note: a view function cannot emit an event.
+                // Off-chain monitoring detects the rejection via the false return.
                 return false;
             }
 
-            // Regle [2] : Plafond de concentration individuelle
-            // Verification que le cumul ne depasse pas le plafond configure
-            uint256 montantCumule = _montantsInvestisParInvestisseur[investisseur] + montant;
-            if (montantCumule > _plafondSouscriptionIndividuelEUR) {
+            // Rule [2]: Individual concentration cap
+            // Checks that the cumulative amount does not exceed the configured cap
+            uint256 cumulativeAmount = amountAlreadyInvested + amount;
+            if (cumulativeAmount > _individualSubscriptionCapEUR) {
                 return false;
             }
 
         } else {
-            // --- RACHAT ---
+            // --- REDEMPTION ---
 
-            // Regle [1] : Rachat avant lock-up autorise mais avec penalite (non-bloquant)
-            // Les frais majores seront calcules par calculerFraisRachatComplets()
-            // On ne bloque pas le rachat anticipe : l'investisseur a le droit de sortir
-            // mais il paie une penalite pour proteger les autres porteurs.
+            // Rule [1]: Redemption before lock-up is allowed but penalized
+            // (non-blocking). The increased fee is computed by
+            // calculateFullRedemptionFees(). We do not block early
+            // redemption: the investor has the right to exit, but pays a
+            // penalty to protect the remaining holders.
 
-            // Regle [2] : Verification basique du montant
-            if (montant == 0) return false;
+            // Rule [2]: Basic amount check
+            if (amount == 0) return false;
         }
 
         return true;
     }
 
-    // =========================================================================
-    // MODULE 5 : CALCULS ACTUARIELS AVANCES
-    // =========================================================================
-    // Ces fonctions sont pure ou view et peuvent etre appelees par n'importe quel
-    // contrat (FondTokenise, TokenizedAsset, TokenizedAssetHolding) sans restriction.
+    /// @notice Computes whether the lock-up period has elapsed for an investor
+    /// @param firstEntryTimestamp Investor's first-entry timestamp, as read by
+    ///   the caller from TokenizedISIN.getShareholderRecord(investor).firstEntryTimestamp
+    ///   (0 if the investor has never subscribed).
+    /// @return isLockupElapsed True if the investor can redeem without penalty
+    /// @return secondsRemaining Seconds remaining before the lock-up ends (0 if elapsed)
+    function checkLockup(uint256 firstEntryTimestamp)
+        external
+        view
+        returns (bool isLockupElapsed, uint256 secondsRemaining)
+    {
+        if (firstEntryTimestamp == 0) {
+            // Never subscribed: lock-up not applicable
+            return (true, 0);
+        }
 
-    /// @notice Calcule les interets simples (convention ACT/365, europeenne)
-    /// @param principal Montant initial en EUR (18 decimales)
-    /// @param tauxAnnuelBp Taux d'interet annuel en bp (ex: 350 = 3.50%)
-    /// @param nombreJours Duree de placement en jours calendaires
-    /// @return montantFinal Montant apres interets (18 decimales)
-    /// @return interets Interets generes (18 decimales)
-    ///
-    /// @dev Convention ACT/365 : interets = principal × taux × jours / 365
-    ///   Methode simple (pas de capitalisation) : appropriee pour les instruments
-    ///   court terme (< 1 an). Pour les interets composes, voir calculerInteretsComposes.
-    ///   L'ecart simple vs compose pour 1 an a 3.5% est de ~0.06% (negligeable en MMF).
-    function calculerInteretsSimples(
-        uint256 principal,
-        uint256 tauxAnnuelBp,
-        uint256 nombreJours
-    ) external pure returns (uint256 montantFinal, uint256 interets) {
-        require(principal > 0,          "TOOLBOX: Principal nul");
-        require(tauxAnnuelBp > 0,       "TOOLBOX: Taux nul");
-        require(nombreJours > 0,        "TOOLBOX: Duree nulle");
-        require(tauxAnnuelBp <= BASE_POINTS, "TOOLBOX: Taux superieur a 100%");
-
-        // Interets = Principal × (tauxBp / BASE_POINTS) × (jours / JOURS_PAR_AN)
-        // = mulDiv(principal × tauxBp, jours, BASE_POINTS × JOURS_PAR_AN)
-        // On decompose en deux mulDiv pour plus de lisibilite :
-        interets = Math.mulDiv(
-            Math.mulDiv(principal, tauxAnnuelBp, BASE_POINTS),
-            nombreJours,
-            JOURS_PAR_AN
-        );
-
-        montantFinal = principal + interets;
+        uint256 lockupEnd = firstEntryTimestamp + LOCK_UP_PERIOD;
+        if (block.timestamp >= lockupEnd) {
+            return (true, 0);
+        } else {
+            return (false, lockupEnd - block.timestamp);
+        }
     }
 
-    /// @notice Calcule les interets avec capitalisation annuelle (methode ICMA)
-    /// @param principal Montant initial en EUR (18 decimales)
-    /// @param tauxAnnuelBp Taux d'interet annuel en bp
-    /// @param nombreJours Duree de placement en jours
-    /// @return montantFinal Montant apres capitalisation (18 decimales)
-    /// @return interets Interets cumules generes (18 decimales)
-    ///
-    /// @dev Approximation de Taylor au 2eme ordre de (1+r)^(t/365) :
-    ///   (1+r)^t ≈ 1 + r*t + r²*t*(t-1)/2
-    ///   Pour r < 10% et t < 2 ans, l'erreur est inferieure a 0.01%.
-    ///   Methode recommandee par l'ICMA (International Capital Market Association).
-    function calculerInteretsComposes(
-        uint256 principal,
-        uint256 tauxAnnuelBp,
-        uint256 nombreJours
-    ) external pure returns (uint256 montantFinal, uint256 interets) {
-        require(principal > 0, "TOOLBOX: Principal nul");
-        require(tauxAnnuelBp > 0, "TOOLBOX: Taux nul");
-        require(nombreJours > 0, "TOOLBOX: Duree nulle");
-        require(tauxAnnuelBp <= BASE_POINTS, "TOOLBOX: Taux superieur a 100%");
+    // =========================================================================
+    // MODULE 5 : ADVANCED ACTUARIAL CALCULATIONS
+    // =========================================================================
+    // These functions are pure or view and can be called by any contract
+    // (Fund, EMT, TokenizedAssets, TokenizedISIN) without restriction.
 
-        // Terme 1 (lineaire) : r × t / 365 (equivalent interets simples)
-        uint256 terme1 = Math.mulDiv(
-            Math.mulDiv(principal, tauxAnnuelBp, BASE_POINTS),
-            nombreJours,
-            JOURS_PAR_AN
+    /// @notice Computes simple interest (ACT/365, European convention)
+    /// @param principal Initial amount in EUR (18 decimals)
+    /// @param annualRateBp Annual interest rate in bp (e.g. 350 = 3.50%)
+    /// @param numberOfDays Investment duration in calendar days
+    /// @return finalAmount Amount after interest (18 decimals)
+    /// @return interest Interest generated (18 decimals)
+    ///
+    /// @dev ACT/365 convention: interest = principal x rate x days / 365
+    ///   Simple method (no compounding): appropriate for short-term
+    ///   instruments (< 1 year). See calculateCompoundInterest for
+    ///   compound interest. The simple-vs-compound gap for 1 year at 3.5%
+    ///   is ~0.06% (negligible for an MMF).
+    function calculateSimpleInterest(
+        uint256 principal,
+        uint256 annualRateBp,
+        uint256 numberOfDays
+    ) external pure returns (uint256 finalAmount, uint256 interest) {
+        require(principal > 0,           "TOOLBOX: Zero principal");
+        require(annualRateBp > 0,        "TOOLBOX: Zero rate");
+        require(numberOfDays > 0,        "TOOLBOX: Zero duration");
+        require(annualRateBp <= BASE_POINTS, "TOOLBOX: Rate above 100%");
+
+        // Interest = Principal x (rateBp / BASE_POINTS) x (days / DAYS_PER_YEAR)
+        // = mulDiv(principal x rateBp, days, BASE_POINTS x DAYS_PER_YEAR)
+        // Decomposed into two mulDiv calls for readability:
+        interest = Math.mulDiv(
+            Math.mulDiv(principal, annualRateBp, BASE_POINTS),
+            numberOfDays,
+            DAYS_PER_YEAR
         );
 
-        // Terme 2 (quadratique) : r² × t × (t-1) / (2 × 365²)
-        // Correction de capitalisation : represente le gain sur le gain
-        // Significatif pour t > 180j ou r > 5%
-        uint256 terme2 = 0;
-        if (nombreJours > 1) {
-            // r² × t(t-1) / (2 × 365²)
-            // On calcule en plusieurs etapes pour eviter l'overflow
-            uint256 r2 = Math.mulDiv(tauxAnnuelBp, tauxAnnuelBp, BASE_POINTS * BASE_POINTS);
-            terme2 = Math.mulDiv(
-                Math.mulDiv(principal * r2, nombreJours * (nombreJours - 1), PRECISION),
+        finalAmount = principal + interest;
+    }
+
+    /// @notice Computes interest with annual compounding (ICMA method)
+    /// @param principal Initial amount in EUR (18 decimals)
+    /// @param annualRateBp Annual interest rate in bp
+    /// @param numberOfDays Investment duration in days
+    /// @return finalAmount Amount after compounding (18 decimals)
+    /// @return interest Cumulative interest generated (18 decimals)
+    ///
+    /// @dev Second-order Taylor approximation of (1+r)^(t/365):
+    ///   (1+r)^t ~= 1 + r*t + r^2*t*(t-1)/2
+    ///   For r < 10% and t < 2 years, the error is under 0.01%.
+    ///   Method recommended by ICMA (International Capital Market Association).
+    function calculateCompoundInterest(
+        uint256 principal,
+        uint256 annualRateBp,
+        uint256 numberOfDays
+    ) external pure returns (uint256 finalAmount, uint256 interest) {
+        require(principal > 0, "TOOLBOX: Zero principal");
+        require(annualRateBp > 0, "TOOLBOX: Zero rate");
+        require(numberOfDays > 0, "TOOLBOX: Zero duration");
+        require(annualRateBp <= BASE_POINTS, "TOOLBOX: Rate above 100%");
+
+        // Term 1 (linear): r x t / 365 (equivalent to simple interest)
+        uint256 term1 = Math.mulDiv(
+            Math.mulDiv(principal, annualRateBp, BASE_POINTS),
+            numberOfDays,
+            DAYS_PER_YEAR
+        );
+
+        // Term 2 (quadratic): r^2 x t x (t-1) / (2 x 365^2)
+        // Compounding correction: represents the "gain on the gain"
+        // Significant for t > 180d or r > 5%
+        uint256 term2 = 0;
+        if (numberOfDays > 1) {
+            // r^2 x t(t-1) / (2 x 365^2)
+            // Computed in several steps to avoid overflow
+            uint256 r2 = Math.mulDiv(annualRateBp, annualRateBp, BASE_POINTS * BASE_POINTS);
+            term2 = Math.mulDiv(
+                Math.mulDiv(principal * r2, numberOfDays * (numberOfDays - 1), PRECISION),
                 PRECISION,
-                2 * JOURS_PAR_AN * JOURS_PAR_AN
+                2 * DAYS_PER_YEAR * DAYS_PER_YEAR
             );
         }
 
-        interets     = terme1 + terme2;
-        montantFinal = principal + interets;
+        interest    = term1 + term2;
+        finalAmount = principal + interest;
     }
 
-    /// @notice Calcule le taux de rendement actuariel annualise (yield) d'un instrument
-    /// @param prixAchat Prix d'achat en EUR (18 decimales)
-    /// @param valeurRemboursement Valeur de remboursement (nominal) en EUR (18 decimales)
-    /// @param dureeJours Duree de detention en jours
-    /// @return tauxRendementBp Taux de rendement annualise en points de base
+    /// @notice Computes the annualized actuarial yield rate of an instrument
+    /// @param purchasePrice Purchase price in EUR (18 decimals)
+    /// @param redemptionValue Redemption (face) value in EUR (18 decimals)
+    /// @param durationDays Holding duration in days
+    /// @return yieldRateBp Annualized yield rate in basis points
     ///
-    /// @dev Formule de taux de rendement simple annualise (ACT/365) :
-    ///   taux (bp) = (VR - PA) / PA × 365 / duree × 10 000
-    ///   Retourne 0 si VR <= PA (rendement nul ou negatif — cas taux negatifs de marche)
-    function calculerTauxRendement(
-        uint256 prixAchat,
-        uint256 valeurRemboursement,
-        uint256 dureeJours
-    ) external pure returns (uint256 tauxRendementBp) {
-        require(prixAchat > 0, "TOOLBOX: Prix d'achat nul");
-        require(dureeJours > 0, "TOOLBOX: Duree nulle");
+    /// @dev Simple annualized yield formula (ACT/365):
+    ///   rate (bp) = (RV - PP) / PP x 365 / duration x 10,000
+    ///   Returns 0 if RV <= PP (zero or negative yield — negative market
+    ///   rate scenario)
+    function calculateYieldRate(
+        uint256 purchasePrice,
+        uint256 redemptionValue,
+        uint256 durationDays
+    ) external pure returns (uint256 yieldRateBp) {
+        require(purchasePrice > 0, "TOOLBOX: Zero purchase price");
+        require(durationDays > 0, "TOOLBOX: Zero duration");
 
-        // Rendement negatif ou nul : on retourne 0
-        // (incompatible avec uint, a signaler au gestionnaire)
-        if (valeurRemboursement <= prixAchat) return 0;
+        // Negative or zero yield: return 0
+        // (incompatible with uint, should be flagged to the manager)
+        if (redemptionValue <= purchasePrice) return 0;
 
-        uint256 gain = valeurRemboursement - prixAchat;
+        uint256 gain = redemptionValue - purchasePrice;
 
-        // taux (bp) = gain/prixAchat × (365/duree) × 10000
-        // = mulDiv(gain × 365 × 10000, 1, prixAchat × duree)
-        // Formule robuste avec mulDiv pour eviter overflow :
-        tauxRendementBp = Math.mulDiv(
-            gain * JOURS_PAR_AN * BASE_POINTS,
+        // rate (bp) = gain/purchasePrice x (365/duration) x 10000
+        // = mulDiv(gain x 365 x 10000, 1, purchasePrice x duration)
+        // Robust formulation with mulDiv to avoid overflow:
+        yieldRateBp = Math.mulDiv(
+            gain * DAYS_PER_YEAR * BASE_POINTS,
             PRECISION,
-            prixAchat * dureeJours
+            purchasePrice * durationDays
         ) / PRECISION;
-        // Division finale par PRECISION pour annuler l'amplification
-        // On ne peut pas simplifier PRECISION hors car gain*365*10000 pourrait overflow
-
-        // Formulation alternative plus simple (acceptable si prixAchat >= PRECISION) :
-        // tauxRendementBp = (gain * JOURS_PAR_AN * BASE_POINTS) / (prixAchat / PRECISION * dureeJours);
+        // Final division by PRECISION to cancel the amplification factor.
+        // Cannot simplify PRECISION away because gain*365*10000 could overflow.
     }
 
-    /// @notice Calcule la duration de Macaulay ponderee d'un portefeuille d'instruments bullet
-    /// @param valeurs Valeurs actuelles de chaque instrument (EUR, 18 dec)
-    /// @param maturitesJours Maturites restantes de chaque instrument en jours
-    /// @return durationPondereeJours Duration ponderee du portefeuille en jours
+    /// @notice Computes the value-weighted Macaulay duration of a portfolio of bullet instruments
+    /// @param values Current value of each instrument (EUR, 18 dec)
+    /// @param maturitiesDays Remaining maturity of each instrument in days
+    /// @return weightedDurationDays Value-weighted portfolio duration in days
     ///
-    /// @dev Duration de Macaulay pour instruments zero-coupon (bullet) :
-    ///   duration(i) = maturite(i) (car tout le cash-flow est a maturite)
-    ///   Duration ponderee = sum(valeur(i) × maturite(i)) / sum(valeur(i))
+    /// @dev Macaulay duration for zero-coupon (bullet) instruments:
+    ///   duration(i) = maturity(i) (all cash flow occurs at maturity)
+    ///   Weighted duration = sum(value(i) x maturity(i)) / sum(value(i))
     ///
-    ///   Pertinence : la duration mesure la sensibilite de la valeur du portefeuille
-    ///   a une variation des taux d'interet (+1% taux = -duration% valeur).
-    ///   Un portefeuille MMF avec duration 90j a une sensibilite de 0.25%/1%taux.
-    function calculerDurationPortefeuille(
-        uint256[] calldata valeurs,
-        uint256[] calldata maturitesJours
-    ) external pure returns (uint256 durationPondereeJours) {
-        require(valeurs.length == maturitesJours.length, "TOOLBOX: Tableaux de tailles differentes");
-        require(valeurs.length > 0, "TOOLBOX: Portefeuille vide");
-        require(valeurs.length <= MAX_ACTIFS_PORTEFEUILLE, "TOOLBOX: Trop d'actifs");
+    ///   Relevance: duration measures the sensitivity of the portfolio's
+    ///   value to a change in interest rates (+1% rate = -duration% value).
+    ///   An MMF portfolio with a 90-day duration has a sensitivity of
+    ///   0.25%/1%rate.
+    function calculatePortfolioDuration(
+        uint256[] calldata values,
+        uint256[] calldata maturitiesDays
+    ) external pure returns (uint256 weightedDurationDays) {
+        require(values.length == maturitiesDays.length, "TOOLBOX: Arrays have different lengths");
+        require(values.length > 0, "TOOLBOX: Empty portfolio");
+        require(values.length <= MAX_PORTFOLIO_ASSETS, "TOOLBOX: Too many assets");
 
-        uint256 sommeValeurs = 0;
-        uint256 sommeValeursXMaturites = 0;
+        uint256 sumValues = 0;
+        uint256 sumValuesTimesMaturities = 0;
 
-        for (uint256 i = 0; i < valeurs.length; i++) {
-            sommeValeurs += valeurs[i];
-            // mulDiv(valeur, maturite, 1) = valeur × maturite (sans division)
-            // On utilise mulDiv pour la coherence et la protection overflow
-            sommeValeursXMaturites += Math.mulDiv(valeurs[i], maturitesJours[i], 1);
+        for (uint256 i = 0; i < values.length; i++) {
+            sumValues += values[i];
+            // mulDiv(value, maturity, 1) = value x maturity (no division)
+            // Uses mulDiv for consistency and overflow protection
+            sumValuesTimesMaturities += Math.mulDiv(values[i], maturitiesDays[i], 1);
         }
 
-        if (sommeValeurs == 0) return 0;
+        if (sumValues == 0) return 0;
 
-        // Duration = sum(valeur × maturite) / sum(valeur)
-        durationPondereeJours = sommeValeursXMaturites / sommeValeurs;
+        // Duration = sum(value x maturity) / sum(value)
+        weightedDurationDays = sumValuesTimesMaturities / sumValues;
     }
 
-    /// @notice Verifie que la duration du portefeuille respecte la limite de la strategie
-    /// @param valeurs Valeurs actuelles des instruments
-    /// @param maturitesJours Maturites restantes
-    /// @return respecteLimite True si duration <= limite strategique
-    /// @return durationActuelle Duration calculee en jours
-    function verifierDurationPortefeuille(
-        uint256[] calldata valeurs,
-        uint256[] calldata maturitesJours
-    ) external view returns (bool respecteLimite, uint256 durationActuelle) {
-        durationActuelle = this.calculerDurationPortefeuille(valeurs, maturitesJours);
-        respecteLimite = durationActuelle <= _strategie.durationMaxJours;
+    /// @notice Checks that portfolio duration respects the strategy's limit
+    /// @param values Current values of the instruments
+    /// @param maturitiesDays Remaining maturities
+    /// @return withinLimit True if duration <= the strategy's limit
+    /// @return currentDuration Computed duration in days
+    function checkPortfolioDuration(
+        uint256[] calldata values,
+        uint256[] calldata maturitiesDays
+    ) external view returns (bool withinLimit, uint256 currentDuration) {
+        currentDuration = this.calculatePortfolioDuration(values, maturitiesDays);
+        withinLimit = currentDuration <= _strategy.maxDurationDays;
     }
 
     // =========================================================================
-    // MODULE 6 : CALCULS DE VALORISATION NAV AVANCES
+    // MODULE 6 : ADVANCED NAV VALUATION CALCULATIONS
     // =========================================================================
 
-    /// @notice Calcule la NAV nette par part apres deduction des frais courants prorata
-    /// @param actifNetBrut Actif net brut avant frais (EUR, 18 dec)
-    /// @param nombreParts Nombre de parts en circulation
-    /// @param dureeSecondesCycle Duree du cycle NAV (secondes)
-    /// @return navNette NAV par part nette en EUR (18 decimales)
-    /// @return totalFraisPrelevesCycle Frais totaux deduits pour ce cycle en EUR
-    function calculerNAVNette(
-        uint256 actifNetBrut,
-        uint256 nombreParts,
-        uint256 dureeSecondesCycle
-    ) external view returns (uint256 navNette, uint256 totalFraisPrelevesCycle) {
-        require(actifNetBrut > 0, "TOOLBOX: Actif net brut nul");
-        require(nombreParts > 0,  "TOOLBOX: Nombre de parts nul");
-        require(dureeSecondesCycle > 0, "TOOLBOX: Duree cycle nulle");
+    /// @notice Computes net NAV per share after deducting prorata ongoing fees
+    /// @param grossNetAssets Gross net assets before fees (EUR, 18 dec)
+    /// @param numberOfShares Number of shares outstanding
+    /// @param cycleDurationSeconds Duration of the NAV cycle (seconds)
+    /// @return netNAV Net NAV per share in EUR (18 decimals)
+    /// @return totalFeesChargedThisCycle Total fees deducted for this cycle, in EUR
+    function calculateNetNAV(
+        uint256 grossNetAssets,
+        uint256 numberOfShares,
+        uint256 cycleDurationSeconds
+    ) external view returns (uint256 netNAV, uint256 totalFeesChargedThisCycle) {
+        require(grossNetAssets > 0, "TOOLBOX: Zero gross net assets");
+        require(numberOfShares > 0, "TOOLBOX: Zero number of shares");
+        require(cycleDurationSeconds > 0, "TOOLBOX: Zero cycle duration");
 
-        // Calcul des frais courants prorata du cycle
+        // Compute the cycle's prorata ongoing fees
         (
-            uint256 fraisGestion,
-            uint256 fraisDepositaire,
-            uint256 fraisAdmin
-        ) = this.calculerFraisCourantsProrata(actifNetBrut, dureeSecondesCycle);
+            uint256 managementFee,
+            uint256 custodyFee,
+            uint256 adminFee
+        ) = this.calculateProrataOngoingFees(grossNetAssets, cycleDurationSeconds);
 
-        totalFraisPrelevesCycle = fraisGestion + fraisDepositaire + fraisAdmin;
+        totalFeesChargedThisCycle = managementFee + custodyFee + adminFee;
 
-        // Actif net apres deduction des frais courants
-        uint256 actifNetApres = actifNetBrut > totalFraisPrelevesCycle
-            ? actifNetBrut - totalFraisPrelevesCycle
+        // Net assets after deducting ongoing fees
+        uint256 netAssetsAfter = grossNetAssets > totalFeesChargedThisCycle
+            ? grossNetAssets - totalFeesChargedThisCycle
             : 0;
 
-        // NAV par part = actif net / nombre de parts (avec precision 18 dec)
-        navNette = Math.mulDiv(actifNetApres, PRECISION, nombreParts);
+        // NAV per share = net assets / number of shares (18 dec precision)
+        netNAV = Math.mulDiv(netAssetsAfter, PRECISION, numberOfShares);
     }
 
-    /// @notice Calcule le nombre de parts a emettre pour un montant de souscription
-    /// @param montantSouscriptionEUR Montant net apres frais en EUR (18 dec)
-    /// @param navParPart NAV par part du cycle courant en EUR (18 dec)
-    /// @return nombreParts Nombre de parts a emettre (18 dec, arrondi vers le bas)
+    /// @notice Computes the number of shares to issue for a subscription amount
+    /// @param subscriptionAmountEUR Net amount after fees, in EUR (18 dec)
+    /// @param navPerShare NAV per share for the current cycle, in EUR (18 dec)
+    /// @return numberOfShares Number of shares to issue (18 dec, rounded down)
     ///
-    /// @dev Arrondi vers le bas (floor) : protection en faveur du fonds.
-    ///   Le residuel (montant non couvert par la derniere part) reste en liquidite.
-    ///   Exemple : 150 001 EUR souscription, NAV = 1 000 EUR
-    ///     -> parts = 150 001 / 1 000 = 150.001 -> 150 parts emises
-    ///     -> residuel = 1 EUR reste en liquidites du fonds
-    function calculerPartsAEmettre(
-        uint256 montantSouscriptionEUR,
-        uint256 navParPart
-    ) external pure returns (uint256 nombreParts) {
-        require(montantSouscriptionEUR > 0, "TOOLBOX: Montant de souscription nul");
-        require(navParPart > 0,             "TOOLBOX: NAV par part nulle");
+    /// @dev Rounded down (floor): protects the fund.
+    ///   The residual (the amount not covered by the last share) remains
+    ///   in cash.
+    ///   Example: 150,001 EUR subscription, NAV = 1,000 EUR
+    ///     -> shares = 150,001 / 1,000 = 150.001 -> 150 shares issued
+    ///     -> residual = 1 EUR remains in the fund's cash
+    function calculateSharesToIssue(
+        uint256 subscriptionAmountEUR,
+        uint256 navPerShare
+    ) external pure returns (uint256 numberOfShares) {
+        require(subscriptionAmountEUR > 0, "TOOLBOX: Zero subscription amount");
+        require(navPerShare > 0,           "TOOLBOX: Zero NAV per share");
 
-        // parts = (montant × PRECISION) / navParPart
-        // La multiplication par PRECISION compense la division pour garder 18 dec
-        nombreParts = Math.mulDiv(montantSouscriptionEUR, PRECISION, navParPart);
+        // shares = (amount x PRECISION) / navPerShare
+        // Multiplying by PRECISION compensates the division to preserve 18 dec
+        numberOfShares = Math.mulDiv(subscriptionAmountEUR, PRECISION, navPerShare);
     }
 
-    /// @notice Calcule le montant EUR brut a verser pour le rachat de parts
-    /// @param nombreParts Nombre de parts a racheter (18 dec)
-    /// @param navParPart NAV par part du cycle courant (18 dec)
-    /// @return montantBrutEUR Montant brut avant deduction des frais de rachat (18 dec)
-    function calculerMontantRachat(
-        uint256 nombreParts,
-        uint256 navParPart
-    ) external pure returns (uint256 montantBrutEUR) {
-        require(nombreParts > 0,  "TOOLBOX: Nombre de parts nul");
-        require(navParPart > 0,   "TOOLBOX: NAV par part nulle");
+    /// @notice Computes the gross EUR amount to pay out for a share redemption
+    /// @param numberOfShares Number of shares to redeem (18 dec)
+    /// @param navPerShare NAV per share for the current cycle (18 dec)
+    /// @return grossAmountEUR Gross amount before deducting redemption fees (18 dec)
+    function calculateRedemptionAmount(
+        uint256 numberOfShares,
+        uint256 navPerShare
+    ) external pure returns (uint256 grossAmountEUR) {
+        require(numberOfShares > 0, "TOOLBOX: Zero number of shares");
+        require(navPerShare > 0,    "TOOLBOX: Zero NAV per share");
 
-        // montant = (nombreParts × navParPart) / PRECISION
-        // Division par PRECISION car les deux operandes sont en 18 dec
-        montantBrutEUR = Math.mulDiv(nombreParts, navParPart, PRECISION);
+        // amount = (numberOfShares x navPerShare) / PRECISION
+        // Divided by PRECISION because both operands are 18 dec
+        grossAmountEUR = Math.mulDiv(numberOfShares, navPerShare, PRECISION);
     }
 
     // =========================================================================
-    // MODULE 7 : ADMINISTRATION DU TOOLBOX
+    // MODULE 7 : TOOLBOX ADMINISTRATION
     // =========================================================================
 
-    /// @notice Enregistre un billet de tresorerie pour suivi de valorisation par amortissement
-    /// @param identifiant ISIN ou identifiant interne (bytes32)
-    /// @param valeurNominale Valeur nominale en EUR (18 dec)
-    /// @param prixAcquisition Prix d'achat en EUR (18 dec, <= valeurNominale)
-    /// @param tauxRendementBp Taux de rendement annuel en bp
-    /// @param dateEmission Timestamp Unix de la date d'emission
-    /// @param dateMaturite Timestamp Unix de la date de maturite
+    /// @notice Registers a commercial paper instrument for amortized valuation tracking
+    /// @param identifier ISIN or internal identifier (bytes32)
+    /// @param faceValue Face value (repayment at maturity), in EUR
+    /// @param acquisitionPrice Acquisition price, in EUR
+    /// @param yieldRateBp Annualized actuarial yield rate, in bp
+    /// @param issuanceDate Unix timestamp of the issuance date
+    /// @param maturityDate Unix timestamp of the maturity date
     ///
-    /// @dev Pattern CEI applique : toutes les verifications avant les modifications d'etat.
-    function enregistrerBilletTresorerie(
-        bytes32 identifiant,
-        uint256 valeurNominale,
-        uint256 prixAcquisition,
-        uint256 tauxRendementBp,
-        uint256 dateEmission,
-        uint256 dateMaturite
+    /// @dev CEI pattern applied: all checks before state changes.
+    function registerCommercialPaper(
+        bytes32 identifier,
+        uint256 faceValue,
+        uint256 acquisitionPrice,
+        uint256 yieldRateBp,
+        uint256 issuanceDate,
+        uint256 maturityDate
     )
         external
-        onlyRole(ROLE_GESTIONNAIRE)
+        onlyRole(MANAGER_ROLE)
         whenNotPaused
         nonReentrant
     {
         // --- CHECKS ---
-        require(identifiant != bytes32(0),                    "TOOLBOX: Identifiant nul");
-        require(valeurNominale > 0,                           "TOOLBOX: Valeur nominale nulle");
-        require(prixAcquisition > 0,                          "TOOLBOX: Prix d'acquisition nul");
-        require(prixAcquisition <= valeurNominale,            "TOOLBOX: Prix > nominal (impossible pour un billet discount)");
-        require(tauxRendementBp > 0,                          "TOOLBOX: Taux de rendement nul");
-        require(tauxRendementBp < BASE_POINTS,                "TOOLBOX: Taux de rendement aberrant (>= 100%)");
-        require(dateEmission < dateMaturite,                  "TOOLBOX: Emission posterieure a la maturite");
-        require(dateMaturite > block.timestamp,               "TOOLBOX: Billet deja echu au moment de l'enregistrement");
-        require(!_billetsTresorerie[identifiant].estActif,    "TOOLBOX: Billet deja enregistre - Utilisez une mise a jour");
+        require(identifier != bytes32(0),                    "TOOLBOX: Zero identifier");
+        require(faceValue > 0,                                "TOOLBOX: Zero face value");
+        require(acquisitionPrice > 0,                         "TOOLBOX: Zero acquisition price");
+        require(acquisitionPrice <= faceValue,                "TOOLBOX: Price > face value (impossible for a discount instrument)");
+        require(yieldRateBp > 0,                              "TOOLBOX: Zero yield rate");
+        require(yieldRateBp < BASE_POINTS,                    "TOOLBOX: Implausible yield rate (>= 100%)");
+        require(issuanceDate < maturityDate,                  "TOOLBOX: Issuance date is after maturity date");
+        require(maturityDate > block.timestamp,               "TOOLBOX: Instrument already matured at registration time");
+        require(!_commercialPapers[identifier].isActive,      "TOOLBOX: Instrument already registered - use an update instead");
 
-        uint256 dureeJours = (dateMaturite - dateEmission) / 1 days;
-        require(dureeJours > 0,   "TOOLBOX: Duree inferieure a 1 jour");
-        require(dureeJours <= 365, "TOOLBOX: Duree > 365 jours - Hors spectre NEU CP (maturite max 1 an)");
+        uint256 durationDays = (maturityDate - issuanceDate) / 1 days;
+        require(durationDays > 0,   "TOOLBOX: Duration under 1 day");
+        require(durationDays <= 365, "TOOLBOX: Duration > 365 days - outside NEU CP scope (max 1-year maturity)");
 
         // --- EFFECTS ---
-        _billetsTresorerie[identifiant] = ParametresBilletTresorerie({
-            identifiant:      identifiant,
-            valeurNominale:   valeurNominale,
-            prixAcquisition:  prixAcquisition,
-            tauxRendementBp:  tauxRendementBp,
-            dateEmission:     dateEmission,
-            dateMaturite:     dateMaturite,
-            dureeJours:       dureeJours,
-            estActif:         true
+        _commercialPapers[identifier] = CommercialPaperParameters({
+            identifier:       identifier,
+            faceValue:        faceValue,
+            acquisitionPrice: acquisitionPrice,
+            yieldRateBp:      yieldRateBp,
+            issuanceDate:     issuanceDate,
+            maturityDate:     maturityDate,
+            durationDays:     durationDays,
+            isActive:         true
         });
 
-        _listeIdentifiantsBillets.push(identifiant);
+        _paperIdentifierList.push(identifier);
 
-        emit BilletTresorerieEnregistre(
-            identifiant,
-            valeurNominale,
-            tauxRendementBp,
-            dureeJours,
+        emit CommercialPaperRegistered(
+            identifier,
+            faceValue,
+            yieldRateBp,
+            durationDays,
             block.timestamp
         );
-        // Pas d'INTERACTIONS : aucun appel externe dans cette fonction
+        // No INTERACTIONS: no external call in this function
     }
 
-    /// @notice Met a jour la structure de frais en vigueur
-    /// @dev Plafonds de securite codes en dur pour prevenir les configurations frauduleuses.
-    ///   Ces plafonds sont inspires des limites AMF pour les fonds de droits francais.
-    function mettreAJourFrais(
-        uint256 fraisSouscriptionBp,
-        uint256 fraisRachatBp,
-        uint256 fraisGestionAnnuelsBp,
-        uint256 fraisPerformanceBp,
-        uint256 hurleRate,
-        uint256 fraisDepositaireBp,
-        uint256 fraisAdminBp,
-        uint256 fraisRachatAnticieBp
+    /// @notice Updates the fee structure in effect
+    /// @dev Hard-coded safety caps prevent fraudulent configurations.
+    ///   These caps are inspired by AMF limits for French-law funds.
+    function updateFees(
+        uint256 subscriptionFeeBp,
+        uint256 redemptionFeeBp,
+        uint256 annualManagementFeeBp,
+        uint256 performanceFeeBp,
+        uint256 hurdleRateBp,
+        uint256 annualCustodyFeeBp,
+        uint256 annualAdminFeeBp,
+        uint256 earlyRedemptionPenaltyBp
     )
         external
-        onlyRole(ROLE_ADMIN_FRAIS)
+        onlyRole(FEE_ADMIN_ROLE)
         whenNotPaused
         nonReentrant
     {
-        // --- CHECKS : plafonds de securite anti-fraude ---
-        // Ces plafonds sont des gardes-fous hard-codes qui ne peuvent pas etre
-        // modifies apres deploiement (ils sont dans le bytecode, pas en storage).
-        require(fraisSouscriptionBp  <= 500,    "TOOLBOX: Frais entree > 5% - Refuse par mesure de securite");
-        require(fraisRachatBp        <= 500,    "TOOLBOX: Frais sortie > 5% - Refuse");
-        require(fraisGestionAnnuelsBp <= 500,   "TOOLBOX: Frais gestion > 5%/an - Refuse");
-        require(fraisPerformanceBp   <= 3_000,  "TOOLBOX: Frais perf > 30% - Refuse");
-        require(hurleRate            <= 2_000,  "TOOLBOX: Hurdle rate > 20%/an - Refuse");
-        require(fraisDepositaireBp   <= 100,    "TOOLBOX: Frais depositaire > 1%/an - Refuse");
-        require(fraisAdminBp         <= 200,    "TOOLBOX: Frais admin > 2%/an - Refuse");
-        require(fraisRachatAnticieBp <= 500,    "TOOLBOX: Penalite rachat anticipe > 5% - Refuse");
+        // --- CHECKS: hard-coded anti-fraud safety caps ---
+        // These caps are hard-coded guardrails that cannot be modified
+        // after deployment (they live in bytecode, not storage).
+        require(subscriptionFeeBp        <= 500,   "TOOLBOX: Entry fee > 5% - Rejected for safety");
+        require(redemptionFeeBp          <= 500,   "TOOLBOX: Exit fee > 5% - Rejected");
+        require(annualManagementFeeBp    <= 500,   "TOOLBOX: Management fee > 5%/yr - Rejected");
+        require(performanceFeeBp         <= 3_000, "TOOLBOX: Performance fee > 30% - Rejected");
+        require(hurdleRateBp             <= 2_000, "TOOLBOX: Hurdle rate > 20%/yr - Rejected");
+        require(annualCustodyFeeBp       <= 100,   "TOOLBOX: Custody fee > 1%/yr - Rejected");
+        require(annualAdminFeeBp         <= 200,   "TOOLBOX: Admin fee > 2%/yr - Rejected");
+        require(earlyRedemptionPenaltyBp <= 500,   "TOOLBOX: Early redemption penalty > 5% - Rejected");
 
         // --- EFFECTS ---
-        _frais = StructureFrais({
-            fraisSouscriptionEntrantBp: fraisSouscriptionBp,
-            fraisRachatSortantBp:       fraisRachatBp,
-            fraisGestionAnnuelsBp:      fraisGestionAnnuelsBp,
-            fraisPerformanceBp:         fraisPerformanceBp,
-            hurleRate:                  hurleRate,
-            fraisDepositaireAnnuelsBp:  fraisDepositaireBp,
-            fraisAdminAnnuelsBp:        fraisAdminBp,
-            fraisRachatAnticieBp:       fraisRachatAnticieBp,
-            derniereMiseAJour:          block.timestamp
+        _fees = FeeStructure({
+            subscriptionFeeBp:        subscriptionFeeBp,
+            redemptionFeeBp:          redemptionFeeBp,
+            annualManagementFeeBp:    annualManagementFeeBp,
+            performanceFeeBp:         performanceFeeBp,
+            hurdleRateBp:             hurdleRateBp,
+            annualCustodyFeeBp:       annualCustodyFeeBp,
+            annualAdminFeeBp:         annualAdminFeeBp,
+            earlyRedemptionPenaltyBp: earlyRedemptionPenaltyBp,
+            lastUpdateTimestamp:      block.timestamp
         });
 
-        emit FraisMisAJour(
-            fraisSouscriptionBp,
-            fraisRachatBp,
-            fraisGestionAnnuelsBp,
-            fraisPerformanceBp,
+        emit FeesUpdated(
+            subscriptionFeeBp,
+            redemptionFeeBp,
+            annualManagementFeeBp,
+            performanceFeeBp,
             block.timestamp,
             msg.sender
         );
-        // Pas d'INTERACTIONS : aucun appel externe
+        // No INTERACTIONS: no external call
     }
 
-    /// @notice Met a jour la strategie d'investissement
-    /// @dev Les allocations doivent totaliser exactement 10 000 bp (via le modifier).
-    ///   Un minimum de 10% de liquidites est impose pour proteger la liquidite du fonds.
-    function mettreAJourStrategie(
-        uint256 allocationBilletsBp,
-        uint256 allocationObligationsBp,
-        uint256 allocationActionsBp,
-        uint256 allocationLiquiditesBp,
-        uint256 toleranceDeviationBp,
-        uint256 durationMaxJours,
-        uint8   ratingMinimum
+    /// @notice Updates the investment strategy
+    /// @dev Allocations must sum to exactly 10,000 bp (enforced by the modifier).
+    ///   A minimum 10% cash allocation is enforced to protect the fund's liquidity.
+    function updateStrategy(
+        uint256 commercialPaperAllocationBp,
+        uint256 bondAllocationBp,
+        uint256 equityAllocationBp,
+        uint256 cashAllocationBp,
+        uint256 deviationToleranceBp,
+        uint256 maxDurationDays,
+        uint8   minRating
     )
         external
-        onlyRole(ROLE_GESTIONNAIRE)
+        onlyRole(MANAGER_ROLE)
         whenNotPaused
         nonReentrant
-        allocationsTotalisent100Pourcent(
-            allocationBilletsBp,
-            allocationObligationsBp,
-            allocationActionsBp,
-            allocationLiquiditesBp
+        targetAllocationsSum100Percent(
+            commercialPaperAllocationBp,
+            bondAllocationBp,
+            equityAllocationBp,
+            cashAllocationBp
         )
     {
         // --- CHECKS ---
-        require(toleranceDeviationBp >= 10,
-            "TOOLBOX: Tolerance deviation < 0.1bp - Trop restrictif (gas excessif)");
-        require(toleranceDeviationBp <= 1_000,
-            "TOOLBOX: Tolerance deviation > 10% - Trop permissif (risque de derive)");
-        require(durationMaxJours >= 1,
-            "TOOLBOX: Duration max < 1 jour - Impossible");
-        require(durationMaxJours <= 730,
-            "TOOLBOX: Duration max > 2 ans - Incompatible avec un profil MMF/FIA court terme");
-        require(ratingMinimum >= 1 && ratingMinimum <= 7,
-            "TOOLBOX: Code rating invalide (1=AAA ... 7=BBB-)");
-        require(allocationLiquiditesBp >= RATIO_LIQUIDITE_MIN_BP,
-            "TOOLBOX: Allocation liquidites < 10% - Risque de liquidite inacceptable (AMF)");
+        require(deviationToleranceBp >= 10,
+            "TOOLBOX: Deviation tolerance < 0.1bp - Too restrictive (excessive gas)");
+        require(deviationToleranceBp <= 1_000,
+            "TOOLBOX: Deviation tolerance > 10% - Too permissive (drift risk)");
+        require(maxDurationDays >= 1,
+            "TOOLBOX: Max duration < 1 day - Impossible");
+        require(maxDurationDays <= 730,
+            "TOOLBOX: Max duration > 2 years - Incompatible with a short-term MMF/AIF profile");
+        require(minRating >= 1 && minRating <= 7,
+            "TOOLBOX: Invalid rating code (1=AAA ... 7=BBB-)");
+        require(cashAllocationBp >= MIN_LIQUIDITY_RATIO_BP,
+            "TOOLBOX: Cash allocation < 10% - Unacceptable liquidity risk (AMF)");
 
         // --- EFFECTS ---
-        _strategie = StrategieInvestissement({
-            allocationBilletsTresorerieBp:  allocationBilletsBp,
-            allocationObligationsBp:         allocationObligationsBp,
-            allocationActionsBp:             allocationActionsBp,
-            allocationLiquiditesBp:          allocationLiquiditesBp,
-            toleranceDeviationBp:            toleranceDeviationBp,
-            durationMaxJours:                durationMaxJours,
-            ratingMinimumContrepartie:       ratingMinimum,
-            derniereMiseAJour:               block.timestamp
+        _strategy = InvestmentStrategy({
+            commercialPaperAllocationBp: commercialPaperAllocationBp,
+            bondAllocationBp:            bondAllocationBp,
+            equityAllocationBp:          equityAllocationBp,
+            cashAllocationBp:            cashAllocationBp,
+            deviationToleranceBp:        deviationToleranceBp,
+            maxDurationDays:             maxDurationDays,
+            minCounterpartyRating:       minRating,
+            lastUpdateTimestamp:         block.timestamp
         });
 
-        emit StrategieMiseAJour(
-            allocationBilletsBp,
-            allocationObligationsBp,
-            toleranceDeviationBp,
-            durationMaxJours,
+        emit StrategyUpdated(
+            commercialPaperAllocationBp,
+            bondAllocationBp,
+            deviationToleranceBp,
+            maxDurationDays,
             block.timestamp,
             msg.sender
         );
-        // Pas d'INTERACTIONS
+        // No INTERACTIONS
     }
 
-    /// @notice Enregistre un investisseur qualifie dans le Toolbox (complement KYC Fund)
-    /// @param investisseur Adresse de l'investisseur
-    /// @param plafondIndividuelEUR Plafond d'investissement individuel (EUR, 18 dec)
-    /// @param datePremiereEntree Timestamp de la premiere souscription (pour lock-up)
-    ///
-    /// @dev Doit etre appele en synchronisation avec le whitelisting dans FondTokenise.
-    ///   Permet au Toolbox de calculer correctement les plafonds et le lock-up.
-    function enregistrerInvestisseurQualifie(
-        address investisseur,
-        uint256 plafondIndividuelEUR,
-        uint256 datePremiereEntree
-    )
-        external
-        onlyRole(ROLE_COMPLIANCE)
-    {
-        // --- CHECKS ---
-        require(investisseur != address(0),                "TOOLBOX: Adresse investisseur invalide");
-        require(plafondIndividuelEUR >= SOUSCRIPTION_MINIMUM,
-            "TOOLBOX: Plafond individuel inferieur au minimum de souscription");
+    /// @notice Updates the individual subscription cap
+    /// @param newCapEUR New cap in EUR (18 dec)
+    function updateSubscriptionCap(
+        uint256 newCapEUR
+    ) external onlyRole(COMPLIANCE_ROLE) {
+        require(newCapEUR >= MINIMUM_SUBSCRIPTION,
+            "TOOLBOX: Cap below the institutional minimum subscription amount");
 
-        // --- EFFECTS ---
-        _investisseursQualifies[investisseur] = true;
+        uint256 previousCap = _individualSubscriptionCapEUR;
+        _individualSubscriptionCapEUR = newCapEUR;
 
-        // Enregistrement de la date de premiere entree pour le calcul du lock-up
-        // On ne remplace la date que si elle n'est pas deja definie (premiere souscription)
-        if (datePremiereEntree > 0 && _datePremiereEntree[investisseur] == 0) {
-            _datePremiereEntree[investisseur] = datePremiereEntree;
-        }
-
-        emit InvestisseurQualifieEnregistre(
-            investisseur,
-            plafondIndividuelEUR,
-            block.timestamp
-        );
+        emit SubscriptionCapUpdated(previousCap, newCapEUR, block.timestamp);
     }
 
-    /// @notice Met a jour le montant cumule investi par un investisseur (synchronise par le Fund)
-    /// @param investisseur Adresse de l'investisseur
-    /// @param montantAdditionnelEUR Montant additionnel souscrit (EUR, 18 dec)
-    /// @dev Seul le contrat Fund autorise peut appeler cette fonction
-    function mettreAJourMontantInvesti(
-        address investisseur,
-        uint256 montantAdditionnelEUR
-    ) external seulementFondAutorise {
-        require(investisseur != address(0), "TOOLBOX: Adresse invalide");
-        _montantsInvestisParInvestisseur[investisseur] += montantAdditionnelEUR;
-    }
-
-    /// @notice Met a jour le plafond de souscription individuel global
-    /// @param nouveauPlafondEUR Nouveau plafond en EUR (18 dec)
-    function mettreAJourPlafondSouscription(
-        uint256 nouveauPlafondEUR
-    ) external onlyRole(ROLE_COMPLIANCE) {
-        require(nouveauPlafondEUR >= SOUSCRIPTION_MINIMUM,
-            "TOOLBOX: Plafond inferieur au minimum de souscription institutionnel");
-
-        uint256 ancienPlafond = _plafondSouscriptionIndividuelEUR;
-        _plafondSouscriptionIndividuelEUR = nouveauPlafondEUR;
-
-        emit PlafondMisAJour(ancienPlafond, nouveauPlafondEUR, block.timestamp);
-    }
-
-    /// @notice Pause d'urgence du Toolbox (circuit breaker reglementaire)
-    function pauserToolbox() external onlyRole(ROLE_ADMIN) {
+    /// @notice Emergency pause of the Toolbox (regulatory circuit breaker)
+    function pauseToolbox() external onlyRole(ADMIN_ROLE) {
         _pause();
     }
 
-    /// @notice Reprise apres pause (necessite ROLE_ADMIN)
-    function reprendreToolbox() external onlyRole(ROLE_ADMIN) {
+    /// @notice Resumes operation after a pause (requires ADMIN_ROLE)
+    function unpauseToolbox() external onlyRole(ADMIN_ROLE) {
         _unpause();
     }
 
     // =========================================================================
-    // FONCTIONS DE LECTURE (VIEW) — TRANSPARENCE ET AUDITABILITE
+    // READ (VIEW) FUNCTIONS — TRANSPARENCY AND AUDITABILITY
     // =========================================================================
-    // Toutes ces fonctions sont view (gratuites en lecture seule).
-    // Elles permettent aux auditeurs, valorisateurs et systemes off-chain
-    // d'acceder aux parametres en vigueur sans frais de gas.
+    // All these functions are view (free, read-only). They let auditors,
+    // valuation agents, and off-chain systems access the parameters in
+    // effect without gas cost.
 
-    /// @notice Retourne la structure de frais en vigueur
-    function lireStructureFrais() external view returns (StructureFrais memory) {
-        return _frais;
+    /// @notice Returns the fee structure in effect
+    function readFeeStructure() external view returns (FeeStructure memory) {
+        return _fees;
     }
 
-    /// @notice Retourne la strategie d'investissement en vigueur
-    function lireStrategie() external view returns (StrategieInvestissement memory) {
-        return _strategie;
+    /// @notice Returns the investment strategy in effect
+    function readStrategy() external view returns (InvestmentStrategy memory) {
+        return _strategy;
     }
 
-    /// @notice Retourne le High Water Mark actuel
-    function lireHighWaterMark() external view returns (HighWaterMark memory) {
+    /// @notice Returns the current High Water Mark
+    function readHighWaterMark() external view returns (HighWaterMark memory) {
         return _highWaterMark;
     }
 
-    /// @notice Retourne les parametres d'un billet de tresorerie
-    function lireBilletTresorerie(bytes32 identifiant)
+    /// @notice Returns the parameters of a commercial paper instrument
+    function readCommercialPaper(bytes32 identifier)
         external
         view
-        returns (ParametresBilletTresorerie memory)
+        returns (CommercialPaperParameters memory)
     {
-        return _billetsTresorerie[identifiant];
+        return _commercialPapers[identifier];
     }
 
-    /// @notice Retourne la liste de tous les identifiants de billets enregistres
-    function lireListeBillets() external view returns (bytes32[] memory) {
-        return _listeIdentifiantsBillets;
+    /// @notice Returns the list of all registered paper identifiers
+    function readPaperList() external view returns (bytes32[] memory) {
+        return _paperIdentifierList;
     }
 
-    /// @notice Retourne la tolerance de deviation de portefeuille (bp)
-    function lireToleranceDeviation() external view returns (uint256) {
-        return _strategie.toleranceDeviationBp;
+    /// @notice Returns the portfolio deviation tolerance (bp)
+    function readDeviationTolerance() external view returns (uint256) {
+        return _strategy.deviationToleranceBp;
     }
 
-    /// @notice Retourne la duration maximale autorisee par la strategie (jours)
-    function lireDurationMaxAutorisee() external view returns (uint256) {
-        return _strategie.durationMaxJours;
+    /// @notice Returns the maximum duration allowed by the strategy (days)
+    function readMaxAllowedDuration() external view returns (uint256) {
+        return _strategy.maxDurationDays;
     }
 
-    /// @notice Retourne le total des frais courants annuels en bp (sans frais de perf)
-    /// @dev Utile pour le calcul du TER (Total Expense Ratio) du fonds
-    function lireTotalFraisCourantsAnnuelsBp() external view returns (uint256) {
-        return _frais.fraisGestionAnnuelsBp
-             + _frais.fraisDepositaireAnnuelsBp
-             + _frais.fraisAdminAnnuelsBp;
+    /// @notice Returns the total annual ongoing fees, in bp (excluding performance fee)
+    /// @dev Useful for computing the fund's TER (Total Expense Ratio)
+    function readTotalAnnualOngoingFeesBp() external view returns (uint256) {
+        return _fees.annualManagementFeeBp
+             + _fees.annualCustodyFeeBp
+             + _fees.annualAdminFeeBp;
     }
 
-    /// @notice Retourne le plafond de souscription individuel (EUR, 18 dec)
-    function lirePlafondSouscriptionIndividuel() external view returns (uint256) {
-        return _plafondSouscriptionIndividuelEUR;
-    }
-
-    /// @notice Retourne true si l'investisseur est marque comme qualifie dans le Toolbox
-    function estInvestisseurQualifie(address investisseur) external view returns (bool) {
-        return _investisseursQualifies[investisseur];
-    }
-
-    /// @notice Retourne le montant cumule investi par un investisseur
-    function lireMontantInvesti(address investisseur) external view returns (uint256) {
-        return _montantsInvestisParInvestisseur[investisseur];
-    }
-
-    /// @notice Retourne la date de premiere entree d'un investisseur (pour lock-up)
-    function lireDatePremiereEntree(address investisseur) external view returns (uint256) {
-        return _datePremiereEntree[investisseur];
-    }
-
-    /// @notice Calcule si la periode de lock-up est ecoulee pour un investisseur
-    /// @return estLockupEcoule True si l'investisseur peut racheter sans penalite
-    /// @return secondesRestantes Secondes restantes avant fin du lock-up (0 si ecoule)
-    function verifierLockup(address investisseur)
-        external
-        view
-        returns (bool estLockupEcoule, uint256 secondesRestantes)
-    {
-        uint256 dateEntree = _datePremiereEntree[investisseur];
-        if (dateEntree == 0) {
-            // Jamais souscrit : lock-up non applicable
-            return (true, 0);
-        }
-
-        uint256 finLockup = dateEntree + PERIODE_LOCK_UP;
-        if (block.timestamp >= finLockup) {
-            return (true, 0);
-        } else {
-            return (false, finLockup - block.timestamp);
-        }
+    /// @notice Returns the individual subscription cap (EUR, 18 dec)
+    function readIndividualSubscriptionCap() external view returns (uint256) {
+        return _individualSubscriptionCapEUR;
     }
 }

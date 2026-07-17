@@ -414,32 +414,82 @@ contract EURXT is
     /**
      * @notice Burns `amount` tokens from address `from`, reducing total supply.
      *
-     * @dev Used for fiat redemptions: the burn agent destroys on-chain tokens
-     *      after the corresponding fiat withdrawal has been verified off-chain.
-     *
-     *      Pre-conditions:
-     *        1. `from` must not be the zero address.
-     *        2. `from` must not be blacklisted (a compliance freeze also blocks
-     *           redemptions until the blacklist is lifted).
-     *        3. `amount` must be non-zero.
-     *
-     *      `_burn` internally calls `_beforeTokenTransfer(from, address(0), amount)`,
-     *      which re-checks pause and blacklist state.
-     *
-     * @param from   Address whose tokens will be destroyed.
-     * @param amount Number of tokens to burn, expressed in the smallest unit (6 decimals).
-     *               Pass 1_000_000 to burn exactly 1 token.
      *
      * @custom:access Restricted to `BURNER_ROLE`.
      * @custom:emits  {Transfer} with `to` = address(0) (OZ ERC-20 standard).
      */
+    // =========================================================
+    // Storage
+    // =========================================================
+
+    /// @dev Authorized Address to see its tokens burn (redemption address).
+    ///      Only tokens hold by this address can be burned via burn().
+    address private _redemptionAddress;
+
+    // =========================================================
+    // Events
+    // =========================================================
+
+    /// @notice Issued when the redemption address is updated.
+    /// @param oldAddress The old redemption address.
+    /// @param newAddress The new redemption address.
+    event RedemptionAddressUpdated(address indexed oldAddress, address indexed newAddress);
+
+    // =========================================================
+    // Redemption address management
+    // =========================================================
+
+    /**
+     * @notice Sets the permitted redemption address for burn operations.
+    * @dev Only DEFAULT_ADMIN_ROLE can modify this address.
+    * @param redemptionAddress_ The new redemption address (cannot be address(0)).
+    */
+    function setRedemptionAddress(address redemptionAddress_) external onlyRole(BURNER_ROLE) {
+        LibModifiers.checkNonZero(redemptionAddress_);
+        address oldAddress = _redemptionAddress;
+        _redemptionAddress = redemptionAddress_;
+        emit RedemptionAddressUpdated(oldAddress, redemptionAddress_);
+    }
+
+    /**
+    * @notice Returns the current redemption address.
+    * @return The authorized address for burn operations.
+    */
+    function redemptionAddress() external view returns (address) {
+        return _redemptionAddress;
+    }
+
+    // =========================================================
+    // Burn with restriction
+    // =========================================================
+
+    /**
+    * @notice Burn `amount` tokens from the authorized redemption address.
+    *
+    * @dev This version restricts burn to `_redemptionAddress` only.
+        The `BURNER_ROLE` cannot burn tokens from any account,
+        only from the dedicated redemption account (escrow / redemption pool).
+    *
+    * @param from   Address from which tokens are burned (must be the redemption address).
+    * @param amount Number of tokens to burn (in smaller unit, 6 decimal places).
+    *
+    * @custom:access Restricted to `BURNER_ROLE`.
+    */
     function burn(address from, uint256 amount) external onlyRole(BURNER_ROLE) {
-        LibModifiers.checkNonZero(from);
-        if (_blacklisted[from]) revert LibErrors.Blacklisted(from);
         LibModifiers.checkNonZeroAmount(amount);
+        LibModifiers.checkNonZero(from);
+    
+        // Restriction : Burning is only allowed from the redemption address.
+        if (from != _redemptionAddress) {
+            revert LibErrors.BurnOnlyAllowedFromRedemptionAddress(from, _redemptionAddress);
+        }
+    
+        LibModifiers.checkNotBlacklisted(from, _blacklisted);
+
         _burn(from, amount);
     }
 
+    
     // =========================================================
     // Pause
     // =========================================================
@@ -597,6 +647,8 @@ contract EURXT is
         if (amount == 0) revert LibErrors.RescueAmountZero();
 
         SafeERC20.safeTransfer(IERC20(token), to, amount);
+
+        emit rescueERC20(token, to, amount);
     }
 
     // =========================================================
@@ -712,11 +764,11 @@ contract EURXT is
         if (amount > balanceOf(from))
             revert LibErrors.InsufficientBalance(from, amount);
 
+        emit BlacklistedFundsSeized(from, to, amount);
+
         _seizureInProgress = true;
         _transfer(from, to, amount);
         _seizureInProgress = false;
-
-        emit BlacklistedFundsSeized(from, to, amount);
     }
 
     // =========================================================
