@@ -1,36 +1,25 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.27;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 
 // =============================================================================
-//  SMART CONTRACT TOKENIZED ISIN
+//  SMART CONTRACT TOKENIZED ISIN v2.0
 // =============================================================================
 //
-//  Represents the LIABILITY side of the fund's balance sheet ("Gestion du
-//  passif" in the architecture diagram): the fund SHARES themselves, i.e.
-//  one ERC20 token per ISIN, together with the shareholder register that a
-//  regulated fund is required to maintain.
+//  Represents the LIABILITY side of the fund's balance sheet: the fund SHARES
+//  themselves, i.e. one ERC20 token per ISIN, together with the shareholder
+//  register that a regulated fund is required to maintain.
 //
-//  This contract is the on-chain shareholder register:
-//   - It inherits OpenZeppelin's ERC20 implementation for balances, transfers,
-//     approvals, and total supply.
-//   - It layers a shareholder register on top (whitelist / blacklist / KYC
-//     status, first and last operation timestamps, cumulative amount
-//     invested), and every mint/burn/transfer updates that register.
-//   - Transfers are restricted to whitelisted, non-blacklisted addresses,
-//     which closes the gap noted in the previous version of the fund
-//     contract (direct peer-to-peer transfers used to bypass compliance
-//     checks).
-//
-//  The FUND contract (TokenizedFundPOC) is expected to be granted FUND_ROLE
-//  so it can mint new shares on subscription and burn shares on redemption.
-//  Compliance actions (whitelist/blacklist) are granted COMPLIANCE_ROLE,
-//  which in practice is also granted to the fund contract so that investors
-//  can keep calling whitelistInvestor()/blacklistInvestor() directly on the
-//  fund, which simply forwards the call here.
+//  PHASE 2 UPDATES:
+//  - Added PRECISION constant (1e18) for consistency with Toolbox
+//  - Enhanced ShareholderRecord with amountInvestedInEUR (PRECISION)
+//  - Added getShareholderDataForToolbox() helper for compliance integration
+//  - Added totalAmountInvested tracking for fund-level compliance
+//  - Enhanced events with more detail for audit trail
+//  - Added batch whitelist capability for onboarding efficiency
 // =============================================================================
 
 contract TokenizedISIN is ERC20, AccessControl, Pausable {
@@ -48,21 +37,34 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
     // =========================================================================
+    // CONSTANTS
+    // =========================================================================
+
+    /// @notice Fixed-point precision: 18 decimals (1 EUR = 1e18 units)
+    /// Aligned with Toolbox.PRECISION, EMT.PRECISION, and TokenizedAssets.PRECISION.
+    uint256 public constant PRECISION = 1e18;
+
+    // =========================================================================
     // ISIN IDENTIFICATION
     // =========================================================================
 
     /// @notice ISIN code represented by this contract (purely informative).
     string public isin;
 
+    /// @notice Human-readable name of the fund (e.g., "ABC Money Market Fund").
+    string public fundName;
+
     // =========================================================================
     // SHAREHOLDER REGISTER
     // =========================================================================
 
     /// @notice One entry of the on-chain shareholder register.
+    /// @dev amountInvested is stored in PRECISION (wei) units for consistency
+    ///   with Toolbox calculations and EMT balances.
     struct ShareholderRecord {
         address holder;                 // Blockchain address of the shareholder
         uint256 sharesHeld;              // Shares held (kept in sync with balanceOf)
-        uint256 amountInvested;          // Total amount invested in EUR (cumulative)
+        uint256 amountInvested;          // Total amount invested in EUR (cumulative, PRECISION)
         uint256 firstEntryTimestamp;     // Timestamp of the first subscription
         uint256 lastOperationTimestamp;  // Timestamp of the last operation
         bool    isWhitelisted;           // True once KYC has been validated
@@ -75,6 +77,10 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
     /// @notice Ordered list of shareholder addresses (for audit iteration).
     address[] private _shareholders;
 
+    /// @notice Total amount invested across all shareholders (PRECISION)
+    /// @dev Used by the fund for compliance with concentration limits.
+    uint256 public totalAmountInvested;
+
     // =========================================================================
     // EVENTS
     // =========================================================================
@@ -86,12 +92,34 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
         address indexed shareholder,
         uint256 previousSharesBalance,
         uint256 newSharesBalance,
+        uint256 previousAmountInvested,
+        uint256 newAmountInvested,
         string  reason,
         uint256 timestamp
     );
 
-    event SharesMinted(address indexed to, uint256 amount, uint256 investedAmount, uint256 timestamp);
-    event SharesBurned(address indexed from, uint256 amount, uint256 timestamp);
+    event SharesMinted(
+        address indexed to,
+        uint256 amount,
+        uint256 investedAmount,
+        uint256 totalSharesAfter,
+        uint256 timestamp
+    );
+
+    event SharesBurned(
+        address indexed from,
+        uint256 amount,
+        uint256 remainingShares,
+        uint256 timestamp
+    );
+
+    /// @notice Emitted when totalAmountInvested is updated
+    event TotalInvestedUpdated(
+        uint256 previousTotal,
+        uint256 newTotal,
+        string reason,
+        uint256 timestamp
+    );
 
     // =========================================================================
     // MODIFIERS
@@ -115,6 +143,7 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
     /// @param name_ ERC20 name of the share token (e.g. "Fund XYZ Shares").
     /// @param symbol_ ERC20 symbol of the share token (e.g. "XYZ").
     /// @param isin_ ISIN code represented by this contract (informative).
+    /// @param fundName_ Human-readable fund name.
     /// @param admin Address receiving DEFAULT_ADMIN_ROLE / ADMIN_ROLE / COMPLIANCE_ROLE
     ///   at deployment. This is typically the deployer, who will later grant
     ///   FUND_ROLE to the tokenized fund contract.
@@ -122,10 +151,12 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
         string memory name_,
         string memory symbol_,
         string memory isin_,
+        string memory fundName_,
         address admin
     ) ERC20(name_, symbol_) {
         require(admin != address(0), "TokenizedISIN: invalid admin address");
         isin = isin_;
+        fundName = fundName_;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(ADMIN_ROLE,         admin);
@@ -138,6 +169,7 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
 
     /// @notice Whitelists an investor (KYC validated) and creates a register
     ///   entry for them if this is their first appearance in the register.
+    /// @param shareholder Address to whitelist
     function whitelistShareholder(address shareholder)
         external
         onlyRole(COMPLIANCE_ROLE)
@@ -169,8 +201,42 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
         emit ShareholderWhitelisted(shareholder, block.timestamp);
     }
 
+    /// @notice Batch whitelists multiple investors at once
+    /// @param shareholders Array of addresses to whitelist
+    /// @dev Gas-efficient for onboarding multiple institutional investors.
+    function batchWhitelistShareholders(address[] calldata shareholders)
+        external
+        onlyRole(COMPLIANCE_ROLE)
+        whenNotPaused
+    {
+        for (uint256 i = 0; i < shareholders.length; i++) {
+            address shareholder = shareholders[i];
+            if (shareholder == address(0)) continue;
+            if (_register[shareholder].isBlacklisted) continue;
+
+            bool isNew = (_register[shareholder].firstEntryTimestamp == 0);
+            if (isNew) {
+                _register[shareholder] = ShareholderRecord({
+                    holder:                shareholder,
+                    sharesHeld:            0,
+                    amountInvested:        0,
+                    firstEntryTimestamp:   block.timestamp,
+                    lastOperationTimestamp: block.timestamp,
+                    isWhitelisted:         true,
+                    isBlacklisted:         false
+                });
+                _shareholders.push(shareholder);
+            } else {
+                _register[shareholder].isWhitelisted = true;
+            }
+            emit ShareholderWhitelisted(shareholder, block.timestamp);
+        }
+    }
+
     /// @notice Blacklists an investor (regulatory freeze). Blocks future
     ///   mints, burns, and transfers involving this address.
+    /// @param shareholder Address to blacklist
+    /// @param reason Human-readable reason for blacklisting (regulatory requirement)
     function blacklistShareholder(address shareholder, string calldata reason)
         external
         onlyRole(COMPLIANCE_ROLE)
@@ -190,7 +256,11 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
 
     /// @notice Mints new shares to an investor and updates their register
     ///   entry (invested amount, operation timestamps).
-    /// @dev Called by the fund contract during subscribe().
+    /// @param to Investor address receiving shares
+    /// @param amount Number of shares to mint (in wei/PRECISION)
+    /// @param investedAmount Amount invested in EUR (PRECISION) — used for compliance tracking
+    /// @dev Called by the fund contract during subscribe(). The investedAmount
+    ///   parameter is critical for Toolbox.validateCompliance() calculations.
     function mint(address to, uint256 amount, uint256 investedAmount)
         external
         onlyRole(FUND_ROLE)
@@ -199,6 +269,7 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
         returns (bool)
     {
         uint256 previousBalance = balanceOf(to);
+        uint256 previousInvested = _register[to].amountInvested;
 
         ShareholderRecord storage record = _register[to];
         record.sharesHeld            += amount;
@@ -207,13 +278,29 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
 
         _mint(to, amount);
 
-        emit SharesMinted(to, amount, investedAmount, block.timestamp);
-        emit RegisterUpdated(to, previousBalance, balanceOf(to), "SUBSCRIPTION", block.timestamp);
+        // Update fund-level total invested
+        uint256 previousTotal = totalAmountInvested;
+        totalAmountInvested += investedAmount;
+
+        emit SharesMinted(to, amount, investedAmount, totalSupply(), block.timestamp);
+        emit RegisterUpdated(
+            to,
+            previousBalance,
+            balanceOf(to),
+            previousInvested,
+            record.amountInvested,
+            "SUBSCRIPTION",
+            block.timestamp
+        );
+        emit TotalInvestedUpdated(previousTotal, totalAmountInvested, "SUBSCRIPTION", block.timestamp);
         return true;
     }
 
     /// @notice Burns shares from an investor and updates their register entry.
-    /// @dev Called by the fund contract during redeem().
+    /// @param from Investor address whose shares are burned
+    /// @param amount Number of shares to burn
+    /// @dev Called by the fund contract during redeem(). Does NOT reduce
+    ///   amountInvested (cumulative investment tracking for compliance).
     function burnFrom(address from, uint256 amount)
         external
         onlyRole(FUND_ROLE)
@@ -230,8 +317,16 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
 
         _burn(from, amount);
 
-        emit SharesBurned(from, amount, block.timestamp);
-        emit RegisterUpdated(from, previousBalance, balanceOf(from), "REDEMPTION", block.timestamp);
+        emit SharesBurned(from, amount, balanceOf(from), block.timestamp);
+        emit RegisterUpdated(
+            from,
+            previousBalance,
+            balanceOf(from),
+            record.amountInvested,
+            record.amountInvested,
+            "REDEMPTION",
+            block.timestamp
+        );
         return true;
     }
 
@@ -268,12 +363,52 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
             _register[from].lastOperationTimestamp = block.timestamp;
             _register[to].lastOperationTimestamp   = block.timestamp;
 
-            emit RegisterUpdated(from, previousFromBalance, balanceOf(from), "TRANSFER_OUT", block.timestamp);
-            emit RegisterUpdated(to,   previousToBalance,   balanceOf(to),   "TRANSFER_IN",  block.timestamp);
+            emit RegisterUpdated(
+                from, previousFromBalance, balanceOf(from),
+                _register[from].amountInvested, _register[from].amountInvested,
+                "TRANSFER_OUT", block.timestamp
+            );
+            emit RegisterUpdated(
+                to, previousToBalance, balanceOf(to),
+                _register[to].amountInvested, _register[to].amountInvested,
+                "TRANSFER_IN", block.timestamp
+            );
             return;
         }
 
         super._update(from, to, value);
+    }
+
+    // =========================================================================
+    // TOOLBOX INTEGRATION HELPERS
+    // =========================================================================
+
+    /// @notice Returns shareholder data formatted for Toolbox compliance checks
+    /// @param shareholder Address to query
+    /// @return amountInvested Cumulative amount invested in EUR (PRECISION)
+    /// @return firstEntryTimestamp Timestamp of first subscription (0 = never invested)
+    /// @return isWhitelisted KYC status
+    /// @return isBlacklisted Regulatory freeze status
+    /// @dev This function is specifically designed to be called by the Fund
+    ///   contract, which then passes these values as parameters to
+    ///   Toolbox.validateCompliance() and Toolbox.checkLockup().
+    function getShareholderDataForToolbox(address shareholder)
+        external
+        view
+        returns (
+            uint256 amountInvested,
+            uint256 firstEntryTimestamp,
+            bool isWhitelisted,
+            bool isBlacklisted
+        )
+    {
+        ShareholderRecord memory record = _register[shareholder];
+        return (
+            record.amountInvested,
+            record.firstEntryTimestamp,
+            record.isWhitelisted,
+            record.isBlacklisted
+        );
     }
 
     // =========================================================================
@@ -292,7 +427,18 @@ contract TokenizedISIN is ERC20, AccessControl, Pausable {
 
     /// @notice Returns the shareholder address at a given index (for iteration).
     function shareholderAt(uint256 index) external view returns (address) {
+        require(index < _shareholders.length, "TokenizedISIN: index out of bounds");
         return _shareholders[index];
+    }
+
+    /// @notice Returns all active shareholders and their data
+    /// @dev Gas-intensive for large registers. Use pagination for production.
+    function getAllShareholders() external view returns (ShareholderRecord[] memory) {
+        ShareholderRecord[] memory records = new ShareholderRecord[](_shareholders.length);
+        for (uint256 i = 0; i < _shareholders.length; i++) {
+            records[i] = _register[_shareholders[i]];
+        }
+        return records;
     }
 
     // =========================================================================
