@@ -100,6 +100,13 @@ import "@openzeppelin/contracts/utils/math/SafeCast.sol";
 //   - Reduces the risk of drift between the two contracts
 
 interface IToolbox {
+    // NOTE: FeeStructure/InvestmentStrategy are intentionally NOT redeclared
+    // here. A struct declared inside an interface is a distinct type from
+    // the identically-shaped struct declared inside Toolbox itself, which
+    // would break `override` on any function returning them. Callers that
+    // need individual fields (e.g. the fund's cash/invested split) use the
+    // dedicated scalar getters below instead of reading the whole struct.
+
     function calculateLinearDepreciation(
         uint256 faceValue,
         uint256 annualRateBp,
@@ -112,11 +119,46 @@ interface IToolbox {
         uint8 operationType
     ) external view returns (uint256 fee);
 
+    /// @param firstEntryTimestamp Investor's first-entry timestamp, as read
+    ///   by the caller from
+    ///   TokenizedISIN.getShareholderRecord(investor).firstEntryTimestamp.
+    function calculateFullRedemptionFees(
+        uint256 amount,
+        uint256 firstEntryTimestamp
+    ) external view returns (uint256 fee, bool isEarly);
+
+    function calculateProrataOngoingFees(
+        uint256 totalNetAssets,
+        uint256 cycleDurationSeconds
+    ) external view returns (uint256 managementFee, uint256 custodyFee, uint256 adminFee);
+
+    function calculatePerformanceFees(
+        uint256 currentNAVPerShare,
+        uint256 totalSharesOutstanding
+    ) external view returns (uint256 performanceFee);
+
+    /// @dev Restricted on the implementation side to FUND_AUTHORIZED_ROLE.
+    function updateHighWaterMark(uint256 currentNAVPerShare, uint256 navCycle) external;
+
     function calculatePortfolioAdjustments(
         uint256 totalPortfolioValue,
         uint256[] calldata currentAllocations,
         uint256[] calldata targetAllocations
     ) external pure returns (int256[] memory adjustments);
+
+    function checkLockup(
+        uint256 firstEntryTimestamp
+    ) external view returns (bool isLockupElapsed, uint256 secondsRemaining);
+
+    function calculateSharesToIssue(
+        uint256 subscriptionAmountEUR,
+        uint256 navPerShare
+    ) external pure returns (uint256 numberOfShares);
+
+    function calculateRedemptionAmount(
+        uint256 numberOfShares,
+        uint256 navPerShare
+    ) external pure returns (uint256 grossAmountEUR);
 
     /// @param amountAlreadyInvested Cumulative amount already invested by
     ///   `investor`, as read by the caller from
@@ -128,6 +170,14 @@ interface IToolbox {
         uint8 operationType,
         uint256 amountAlreadyInvested
     ) external view returns (bool isValid);
+
+    /// @notice Cash allocation of the current investment strategy, in bp.
+    /// @dev Used by the fund to derive the invest-vs-retain-cash split: this
+    ///   architecture has a single non-cash asset bucket (TokenizedAssets),
+    ///   so `BASE_POINTS - cashAllocationBp` is the fraction routed there.
+    function readCashAllocationBp() external view returns (uint256);
+
+    function readIndividualSubscriptionCap() external view returns (uint256);
 }
 
 // =============================================================================
@@ -250,6 +300,19 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     /// Capped at 50: avoids loops long enough to exceed the gas limit.
     /// An institutional MMF portfolio generally does not exceed 30 lines.
     uint256 public constant MAX_PORTFOLIO_ASSETS = 50;
+
+    // -------------------------------------------------------------------------
+    // POC COMMERCIAL PAPER IDENTIFIERS
+    // -------------------------------------------------------------------------
+    // Identifiers for the three demo commercial papers from the fund's
+    // origination worksheet (trade date 24/07/2026, maturity 31/12/2026,
+    // 160-day tenor for all three). Registered in bulk by
+    // initializePOCCommercialPapers() below. Mirrored on the TokenizedAssets
+    // side by the identically-named constants in TokenizedAssets.sol.
+
+    bytes32 public constant POC_CP_2PCT_ID   = keccak256("POC CP 2%");
+    bytes32 public constant POC_CP_2_5PCT_ID = keccak256("POC CP 2.5%");
+    bytes32 public constant POC_CP_3PCT_ID   = keccak256("POC CP 3%");
 
     // =========================================================================
     // DATA STRUCTURES
@@ -394,6 +457,10 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
 
     /// @notice List of paper identifiers (for iteration and audit)
     bytes32[] private _paperIdentifierList;
+
+    /// @notice True once initializePOCCommercialPapers() has run. Guards
+    ///   against seeding the three demo commercial papers more than once.
+    bool public pocCommercialPapersInitialized;
 
     /// @notice Default individual subscription cap (EUR, 18 dec)
     /// Protects against excessive concentration in a single investor.
@@ -788,7 +855,7 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     function calculateFullRedemptionFees(
         uint256 amount,
         uint256 firstEntryTimestamp
-    ) external view returns (uint256 fee, bool isEarly) {
+    ) external view override returns (uint256 fee, bool isEarly) {
         require(amount > 0, "TOOLBOX: Zero amount");
 
         isEarly = (firstEntryTimestamp > 0 && block.timestamp < firstEntryTimestamp + LOCK_UP_PERIOD);
@@ -819,6 +886,7 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     )
         external
         view
+        override
         returns (
             uint256 managementFee,
             uint256 custodyFee,
@@ -864,7 +932,7 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     function calculatePerformanceFees(
         uint256 currentNAVPerShare,
         uint256 totalSharesOutstanding
-    ) external view returns (uint256 performanceFee) {
+    ) external view override returns (uint256 performanceFee) {
         // No calculation if no shares are outstanding
         if (totalSharesOutstanding == 0) return 0;
 
@@ -915,7 +983,7 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     function updateHighWaterMark(
         uint256 currentNAVPerShare,
         uint256 navCycle
-    ) external onlyAuthorizedFund {
+    ) external override onlyAuthorizedFund {
         if (currentNAVPerShare > _highWaterMark.highValue) {
             uint256 previousValue = _highWaterMark.highValue;
 
@@ -1127,6 +1195,7 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     function checkLockup(uint256 firstEntryTimestamp)
         external
         view
+        override
         returns (bool isLockupElapsed, uint256 secondsRemaining)
     {
         if (firstEntryTimestamp == 0) {
@@ -1366,7 +1435,7 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     function calculateSharesToIssue(
         uint256 subscriptionAmountEUR,
         uint256 navPerShare
-    ) external pure returns (uint256 numberOfShares) {
+    ) external pure override returns (uint256 numberOfShares) {
         require(subscriptionAmountEUR > 0, "TOOLBOX: Zero subscription amount");
         require(navPerShare > 0,           "TOOLBOX: Zero NAV per share");
 
@@ -1382,7 +1451,7 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     function calculateRedemptionAmount(
         uint256 numberOfShares,
         uint256 navPerShare
-    ) external pure returns (uint256 grossAmountEUR) {
+    ) external pure override returns (uint256 grossAmountEUR) {
         require(numberOfShares > 0, "TOOLBOX: Zero number of shares");
         require(navPerShare > 0,    "TOOLBOX: Zero NAV per share");
 
@@ -1403,7 +1472,11 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     /// @param issuanceDate Unix timestamp of the issuance date
     /// @param maturityDate Unix timestamp of the maturity date
     ///
-    /// @dev CEI pattern applied: all checks before state changes.
+    /// @dev CEI pattern applied: all checks before state changes. Thin
+    ///   wrapper around _registerCommercialPaper() so that
+    ///   initializePOCCommercialPapers() below can reuse the exact same
+    ///   checks/effects/event without re-entering this nonReentrant
+    ///   external function via a self-call (which would revert).
     function registerCommercialPaper(
         bytes32 identifier,
         uint256 faceValue,
@@ -1417,6 +1490,20 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
         whenNotPaused
         nonReentrant
     {
+        _registerCommercialPaper(identifier, faceValue, acquisitionPrice, yieldRateBp, issuanceDate, maturityDate);
+    }
+
+    /// @dev Shared implementation for registerCommercialPaper() and
+    ///   initializePOCCommercialPapers(). See registerCommercialPaper() for
+    ///   parameter documentation.
+    function _registerCommercialPaper(
+        bytes32 identifier,
+        uint256 faceValue,
+        uint256 acquisitionPrice,
+        uint256 yieldRateBp,
+        uint256 issuanceDate,
+        uint256 maturityDate
+    ) internal {
         // --- CHECKS ---
         require(identifier != bytes32(0),                    "TOOLBOX: Zero identifier");
         require(faceValue > 0,                                "TOOLBOX: Zero face value");
@@ -1454,6 +1541,128 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
             block.timestamp
         );
         // No INTERACTIONS: no external call in this function
+    }
+
+    /// @notice One-time POC seeding: registers the three demo commercial
+    ///   papers from the fund's origination worksheet — POC CP 2%, POC CP
+    ///   2.5%, and POC CP 3% — using the exact figures from that worksheet.
+    ///   Safe to call once; reverts on any subsequent call.
+    /// @dev Trade date 24/07/2026 00:00:00 UTC (1784851200), maturity
+    ///   31/12/2026 00:00:00 UTC (1798675200) — a 160-day tenor for all
+    ///   three instruments, matching the worksheet's "nbre de jours avt
+    ///   maturité" column exactly. Discount (faceValue - acquisitionPrice)
+    ///   per paper: 5,000 / 7,500 / 37,500 EUR, matching the worksheet's
+    ///   "Rendement à maturité" column and its 50,000 EUR total
+    ///   ("Montant à linéariser").
+    function initializePOCCommercialPapers() external onlyRole(MANAGER_ROLE) whenNotPaused nonReentrant {
+        require(!pocCommercialPapersInitialized, "TOOLBOX: POC commercial papers already initialized");
+        pocCommercialPapersInitialized = true;
+
+        uint256 tradeDate    = 1784851200; // 24/07/2026 00:00:00 UTC
+        uint256 maturityDate = 1798675200; // 31/12/2026 00:00:00 UTC
+
+        // POC CP 2%  — 500,000 EUR face value, bought at 99.000% of par
+        _registerCommercialPaper(
+            POC_CP_2PCT_ID,
+            500_000 * PRECISION,   // faceValue
+            495_000 * PRECISION,   // acquisitionPrice (99.000% x 500,000)
+            200,                    // yieldRateBp = 2.00%
+            tradeDate,
+            maturityDate
+        );
+
+        // POC CP 2.5% — 500,000 EUR face value, bought at 98.500% of par
+        _registerCommercialPaper(
+            POC_CP_2_5PCT_ID,
+            500_000 * PRECISION,   // faceValue
+            492_500 * PRECISION,   // acquisitionPrice (98.500% x 500,000)
+            250,                    // yieldRateBp = 2.50%
+            tradeDate,
+            maturityDate
+        );
+
+        // POC CP 3%  — 2,000,000 EUR face value, bought at 98.125% of par
+        _registerCommercialPaper(
+            POC_CP_3PCT_ID,
+            2_000_000 * PRECISION,   // faceValue
+            1_962_500 * PRECISION,   // acquisitionPrice (98.125% x 2,000,000)
+            300,                      // yieldRateBp = 3.00%
+            tradeDate,
+            maturityDate
+        );
+    }
+
+    // =========================================================================
+    // MODULE 7B : "BOITE A OUTILS" — REAL-TIME LINEAR YIELD BREAKDOWN
+    // =========================================================================
+    // Reproduces the fund's origination worksheet's right-hand "boite à
+    // outils" table: for a straight-line-amortized discount instrument, the
+    // total discount to be earned by maturity is spread evenly over its
+    // ENTIRE original tenor (from issuance to maturity), expressed as a
+    // constant EUR-per-second rate. This is a fixed rate derived once from
+    // the paper's registered parameters — not a live countdown recomputed
+    // against block.timestamp — exactly mirroring how the worksheet's
+    // "nbre de secondes avant maturité" / "rendement à la seconde" columns
+    // are computed once from the trade date, not re-derived every time the
+    // sheet is opened.
+
+    /// @notice Real-time "boite a outils" yield breakdown for a single
+    ///   registered commercial paper.
+    /// @param identifier ISIN / internal identifier of the registered paper
+    /// @return discountAtMaturity Face value minus acquisition price (EUR, 18 dec)
+    ///   — the worksheet's "Rendement à maturité" column.
+    /// @return daysToMaturity Full original tenor in days (issuance -> maturity)
+    ///   — the worksheet's "nbre de jours avt maturité" column.
+    /// @return minutesToMaturity Full original tenor in minutes
+    ///   — the worksheet's "nombre de minutes avt maturité" column.
+    /// @return secondsToMaturity Full original tenor in seconds
+    ///   — the worksheet's "nombre de seconde avant maturité" column.
+    /// @return yieldPerSecond discountAtMaturity / secondsToMaturity (EUR/sec, 18 dec)
+    ///   — the worksheet's "rendement à la seconde" column.
+    function calculateYieldToolbox(bytes32 identifier)
+        external
+        view
+        returns (
+            uint256 discountAtMaturity,
+            uint256 daysToMaturity,
+            uint256 minutesToMaturity,
+            uint256 secondsToMaturity,
+            uint256 yieldPerSecond
+        )
+    {
+        CommercialPaperParameters storage paper = _commercialPapers[identifier];
+        require(paper.isActive, "TOOLBOX: Unknown or inactive commercial paper");
+
+        discountAtMaturity = paper.faceValue - paper.acquisitionPrice;
+        daysToMaturity      = paper.durationDays;
+        minutesToMaturity    = paper.durationDays * 1440;
+        secondsToMaturity    = paper.durationDays * 1 days;
+        yieldPerSecond       = discountAtMaturity / secondsToMaturity;
+    }
+
+    /// @notice Portfolio-level aggregation of calculateYieldToolbox() across
+    ///   every ACTIVE registered commercial paper.
+    /// @return totalDiscountToLinearize Sum of (faceValue - acquisitionPrice)
+    ///   across all active papers — the worksheet's "Montant à linéariser"
+    ///   total row (50,000 EUR for the three POC papers).
+    /// @return totalYieldPerSecond Sum of each paper's per-second
+    ///   straight-line yield — the worksheet's bottom-right total
+    ///   (≈0.003616898 EUR/sec for the three POC papers).
+    /// @dev Gas-bounded by MAX_PORTFOLIO_ASSETS, same iteration pattern as
+    ///   the existing readPaperList().
+    function calculatePortfolioYieldToolbox()
+        external
+        view
+        returns (uint256 totalDiscountToLinearize, uint256 totalYieldPerSecond)
+    {
+        for (uint256 i = 0; i < _paperIdentifierList.length; i++) {
+            CommercialPaperParameters storage paper = _commercialPapers[_paperIdentifierList[i]];
+            if (!paper.isActive) continue;
+
+            uint256 discount = paper.faceValue - paper.acquisitionPrice;
+            totalDiscountToLinearize += discount;
+            totalYieldPerSecond      += discount / (paper.durationDays * 1 days);
+        }
     }
 
     /// @notice Updates the fee structure in effect
@@ -1611,6 +1820,14 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
         return _strategy;
     }
 
+    /// @notice Cash allocation of the current investment strategy, in bp.
+    /// @dev Scalar counterpart of readStrategy().cashAllocationBp, exposed
+    ///   directly through IToolbox so external callers (e.g. the fund
+    ///   contract) don't need to know Toolbox's internal struct layout.
+    function readCashAllocationBp() external view override returns (uint256) {
+        return _strategy.cashAllocationBp;
+    }
+
     /// @notice Returns the current High Water Mark
     function readHighWaterMark() external view returns (HighWaterMark memory) {
         return _highWaterMark;
@@ -1649,7 +1866,7 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
     }
 
     /// @notice Returns the individual subscription cap (EUR, 18 dec)
-    function readIndividualSubscriptionCap() external view returns (uint256) {
+    function readIndividualSubscriptionCap() external view override returns (uint256) {
         return _individualSubscriptionCapEUR;
     }
 }
