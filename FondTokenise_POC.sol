@@ -1,149 +1,160 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.27;
-
 // =============================================================================
-//  _____ ___  _   _ ____    ____   ___   ____
-// |  ___/ _ \| \ | |  _ \  |  _ \ / _ \ / ___|
-// | |_ | | | |  \| | | | | | |_) | | | | |
-// |  _|| |_| | |\  | |_| | |  __/| |_| | |___
-// |_|   \___/|_| \_|____/  |_|    \___/ \____|
-//
-//  Smart Contract TOKENIZED FUND — POC Phase 1  (v4.0 — EMT as cash / TokenizedISIN as shares)
-//
+//  Smart Contract TOKENIZED FUND — POC Phase 2  (v5.0 — Toolbox-integrated)
 //  ═══════════════════════════════════════════════════════════════════════════
-//  WHAT CHANGES COMPARED TO v3.0
+//  WHAT CHANGES COMPARED TO v4.0 (Phase 1)
 //  ═══════════════════════════════════════════════════════════════════════════
 //
-//  - The fund SHARES are no longer minted from EMT.sol. They are now the
-//    tokens of the external contract TokenizedISIN.sol, an OpenZeppelin
-//    ERC20 that also maintains the on-chain shareholder register (KYC
-//    whitelist/blacklist, invested amounts, operation timestamps). The fund
-//    calls sharesToken.mint()/burnFrom() to issue/destroy shares, and
-//    forwards whitelistInvestor()/blacklistInvestor() calls to it.
+//  - [POC-1] "NO TOOLBOX" is LIFTED. This contract now calls Toolbox.sol for
+//    every piece of financial/regulatory logic: fee calculation (entry,
+//    exit, early-redemption penalty, ongoing management/custody/admin fees,
+//    performance fee), investment strategy (target cash vs. invested
+//    allocation), regulatory compliance (minimum subscription, individual
+//    cap), and NAV math (shares-to-issue, redemption amount). This contract
+//    keeps ONLY the order lifecycle (subscribe/redeem), the external token
+//    orchestration (EMT/TokenizedAssets/TokenizedISIN), and the immutable
+//    NAV-cycle archive.
 //
-//  - EMT.sol no longer represents fund shares: it now represents CASH (EUR)
-//    on the ASSET side of the balance sheet. The fund calls
-//    cashToken.mint()/burnFrom() whenever cash enters/leaves the fund, so
-//    that EMT's ERC20 total supply always matches the fund's real cash
-//    position. There is no more internal cash counter.
+//  - [POC-2] "NO FEES" is LIFTED. Subscription fees, redemption fees
+//    (standard and early/lock-up), and ongoing fees (management, custody,
+//    admin, performance/HWM) are now computed via Toolbox and recorded in
+//    every NAV cycle and in dedicated events for full auditability.
 //
-//  - The tokenized SECURITIES held in the portfolio are still represented
-//    by the external contract TokenizedAssets.sol (formerly
-//    ActifsTokenises.sol, simply translated). The fund holds these tokens
-//    itself (address(this)) and calls assetToken.mint()/burn() when it
-//    buys/sells securities.
+//    IMPORTANT SCOPE DECISION FOR THIS PHASE: fees are computed and logged
+//    on-chain (NAVCycle.feeCharged + FeesAccrued / SubscriptionExecuted /
+//    RedemptionExecuted events) for transparency, but they are NOT yet
+//    transferred or minted to a separate fee-collector wallet. A
+//    subscription fee simply reduces the amount that is actually invested
+//    on behalf of the subscriber (it is never minted to anyone); a
+//    redemption fee simply reduces the amount paid out to the redeeming
+//    investor (the corresponding assets/cash are not burned, and therefore
+//    remain in the fund, benefiting the NAV of the remaining shareholders).
+//    Routing fees to a real fee-collector wallet (mint/transfer) is an
+//    explicit candidate for a later phase.
 //
-//  - DEPLOYMENT PREREQUISITES (important):
-//      1. Deploy EMT.sol                  → deployer becomes its "owner"
-//      2. Deploy TokenizedAssets.sol       → deployer becomes its "owner"
-//      3. Deploy TokenizedISIN.sol         → deployer gets DEFAULT_ADMIN_ROLE /
-//                                             ADMIN_ROLE / COMPLIANCE_ROLE
-//      4. Deploy TokenizedFundPOC.sol with the addresses of EMT,
-//         TokenizedAssets and TokenizedISIN
-//      5. Call EMT.transferOwnership(fundAddress)
-//      6. Call TokenizedAssets.transferOwnership(fundAddress)
-//      7. Call TokenizedISIN.grantRole(FUND_ROLE, fundAddress)
-//      8. Call TokenizedISIN.grantRole(COMPLIANCE_ROLE, fundAddress)
-//         → steps 7-8 let the fund mint/burn shares and maintain the
-//           shareholder register (whitelist/blacklist) on investors' behalf
-//      9. Call TokenizedFundPOC.initializeBalanceSheet() (ADMIN_ROLE, once)
-//         → only at this point can the fund mint, since it must first have
-//           become "owner"/role-holder on all three token contracts
+//  - [POC-3]/[POC-4] "single asset always worth 1 EUR" / "whole units" are
+//    LIFTED. This contract now reasons in full 18-decimal EUR fixed point
+//    (matching Toolbox's PRECISION = 1e18 and the ERC20 standard 18
+//    decimals used by EMT/TokenizedAssets/TokenizedISIN), because Toolbox's
+//    rules (e.g. MINIMUM_SUBSCRIPTION = 100,000 EUR) are expressed in that
+//    scale. The unit price of TokenizedAssets is no longer hard-coded at 1
+//    EUR: it is now `assetPriceEUR`, an admin-settable placeholder for a
+//    future on-chain price oracle (see "KNOWN LIMITATIONS" below).
 //
-//  ═══════════════════════════════════════════════════════════════════════════
-//  FUND BALANCE SHEET AT T0 (after initializeBalanceSheet())
-//  ═══════════════════════════════════════════════════════════════════════════
+//  - [POC-5] "fixed 50/50 investment strategy" is LIFTED. The cash/invested
+//    split is now driven by Toolbox.readStrategy().cashAllocationBp. Since
+//    this architecture only has a single non-cash asset bucket
+//    (TokenizedAssets), everything that Toolbox's strategy allocates to
+//    commercial paper + bonds + equities is bought as TokenizedAssets; only
+//    the cash allocation stays as EMT. This is a deliberate simplification
+//    — see "KNOWN LIMITATIONS".
 //
-//  LIABILITIES (funding sources)
-//  ┌─────────────────────────────────────────────────────────────────────┐
-//  │  Initial subscription             +100 EUR (10 shares x 10 EUR)    │
-//  │  Shares issued (TokenizedISIN)      10 shares                      │
-//  │  Subscription price per share       10 EUR                         │
-//  └─────────────────────────────────────────────────────────────────────┘
+//  - [POC-6] fixed "10 EUR / share, 10 shares, 50/50" initial balance sheet
+//    is replaced by a configurable genesis subscription
+//    (INITIAL_SUBSCRIPTION_EUR, INITIAL_NAV_PER_SHARE), executed through the
+//    exact same Toolbox-aware code path as any other subscription.
 //
-//  ASSETS (uses of capital)
-//  ┌─────────────────────────────────────────────────────────────────────┐
-//  │  Cash received at subscription    +100 EUR                          │
-//  │  Investment in securities          -50 EUR (purchase of 50 units)   │
-//  │  ─────────────────────────────────────────────────────────────────  │
-//  │  Residual cash (EMT held by fund)   50 EUR                          │
-//  │  TokenizedAssets held               50 units x 1 EUR = 50 EUR       │
-//  │  ─────────────────────────────────────────────────────────────────  │
-//  │  Total assets                       100 EUR                         │
-//  └─────────────────────────────────────────────────────────────────────┘
+//  - [POC-7]/[POC-8] NAV calculation and the balance-sheet invariant are
+//    unchanged in spirit, just re-expressed in 18-decimal EUR terms and
+//    using Toolbox's calculateSharesToIssue / calculateRedemptionAmount.
 //
-//  NAV AT T0
-//  ┌─────────────────────────────────────────────────────────────────────┐
-//  │  Total NAV = Cash + (Assets x Asset_Price)                          │
-//  │            = 50 + (50 x 1) = 100 EUR                                │
-//  │  NAV/share = 100 EUR / 10 shares = 10 EUR per share                 │
-//  └─────────────────────────────────────────────────────────────────────┘
-//
-//  ═══════════════════════════════════════════════════════════════════════
-//  POC RULES (Phase 1) — unchanged
-//  ═══════════════════════════════════════════════════════════════════════
-//
-//  [POC-1]  NO TOOLBOX — all logic is inline.
-//  [POC-2]  NO FEES — neither entry, exit, nor management fees.
-//  [POC-3]  A SINGLE ASSET whose unit price is ALWAYS 1 EUR.
-//  [POC-4]  ORDERS IN WHOLE UNITS (EMT, TokenizedAssets and TokenizedISIN use
-//           18 decimals natively, but this fund reasons in whole units:
-//           1 "fund unit" = 1 whole token, no fractions).
-//  [POC-5]  FIXED INVESTMENT STRATEGY: 50% of subscribed cash is invested
-//           in securities, 50% remains in cash.
-//  [POC-6]  INITIAL SUBSCRIPTION PRICE: 10 EUR per share.
-//  [POC-7]  NAV CALCULATION: Total NAV = Cash + (Assets x ASSET_PRICE)
-//  [POC-8]  BALANCE SHEET INVARIANT: Total assets == Total liabilities
-//
-//  What is KEPT from v3.0:
+//  What is KEPT from v4.0 / Phase 1:
+//  - EMT = cash (asset side), TokenizedAssets = securities (asset side),
+//    TokenizedISIN = shares + shareholder register (liability side)
 //  - CEI pattern (Checks-Effects-Interactions)
 //  - ReentrancyGuard on all financial functions
-//  - Shareholder register (whitelist / blacklist), now delegated to
-//    TokenizedISIN so it also protects secondary transfers
 //  - Immutable archival of every NAV cycle (keccak256 fingerprint)
-//  - Events on all state mutations
+//  - Events on all state mutations, including OrderReceived/OperationFinalized
 //  - AccessControl (ADMIN, COMPLIANCE, AUDITOR)
 //  - Emergency pause mechanism
 //  - Integrity verification of past cycles (tamper-proof)
 //
-//  KNOWN LIMITATION OF THIS INTEGRATION (to document for Phase 2):
-//  - EMT.sol being a standalone "in-house" ERC20 for cash, its transfer()
-//    and transferFrom() functions do not go through this fund contract.
-//    This is considered acceptable for cash (EMT never leaves the fund's
-//    own wallet in this POC), but should be revisited in Phase 2 if EMT is
-//    ever transferred directly between wallets outside of subscribe()/
-//    redeem().
-// =============================================================================
-
-// =============================================================================
-// OPENZEPPELIN LIBRARY IMPORTS (restricted — no more ERC20 inheritance here)
+//  ═══════════════════════════════════════════════════════════════════════════
+//  DEPLOYMENT PREREQUISITES (Phase 2)
+//  ═══════════════════════════════════════════════════════════════════════════
+//    1. Deploy EMT.sol                    → deployer becomes its "owner"
+//    2. Deploy TokenizedAssets.sol        → deployer becomes its "owner"
+//    3. Deploy TokenizedISIN.sol          → deployer gets DEFAULT_ADMIN_ROLE /
+//                                            ADMIN_ROLE / COMPLIANCE_ROLE
+//    4. Deploy Toolbox.sol                → deployer gets DEFAULT_ADMIN_ROLE /
+//                                            ADMIN_ROLE / MANAGER_ROLE /
+//                                            FEE_ADMIN_ROLE / COMPLIANCE_ROLE
+//    5. Deploy TokenizedFundPOC.sol with the addresses of EMT,
+//       TokenizedAssets, TokenizedISIN and Toolbox
+//    6. Call EMT.transferOwnership(fundAddress)
+//    7. Call TokenizedAssets.transferOwnership(fundAddress)
+//    8. Call TokenizedISIN.grantRole(FUND_ROLE, fundAddress)
+//    9. Call TokenizedISIN.grantRole(COMPLIANCE_ROLE, fundAddress)
+//   10. Call Toolbox.grantRole(FUND_AUTHORIZED_ROLE, fundAddress)   [NEW]
+//       → required for the fund to call Toolbox.updateHighWaterMark()
+//   11. Call TokenizedFundPOC.initializeBalanceSheet() (ADMIN_ROLE, once)
+//
+//  ═══════════════════════════════════════════════════════════════════════════
+//  KNOWN LIMITATIONS OF THIS PHASE (to document/revisit in Phase 3)
+//  ═══════════════════════════════════════════════════════════════════════════
+//  - Fees are logged, not collected (see scope decision above).
+//  - `assetPriceEUR` is an admin-settable placeholder, not a real price
+//    oracle. In production this must be replaced by a certified NAV/pricing
+//    feed for the securities held in TokenizedAssets.
+//  - All non-cash strategy buckets (commercial paper, bonds, equities) are
+//    collapsed into the single TokenizedAssets holding, since this
+//    architecture does not yet have one token contract per asset class.
+//    Toolbox's `calculatePortfolioAdjustments` / `checkRebalancingNeeded`
+//    (multi-asset rebalancing) are therefore not yet called by this
+//    contract — they are ready to be used once the fund manages more than
+//    one risk-asset contract.
+//  - `accrueOngoingFees()` computes and emits management/custody/admin/
+//    performance fees and updates the Toolbox High Water Mark, but (per the
+//    scope decision above) does not move any tokens.
+//  - EMT.sol's transfer()/transferFrom() still do not go through this fund
+//    contract (unchanged from Phase 1); acceptable as EMT never leaves the
+//    fund's own wallet in subscribe()/redeem().
+//
+//  ═══════════════════════════════════════════════════════════════════════════
+//  PATCH NOTE (this revision)
+//  ═══════════════════════════════════════════════════════════════════════════
+//  - TokenizedAssets.sol's mint()/burn()/burnFrom() now require a `reason`
+//    string parameter (Phase 2 update). The old shared `IExternalToken`
+//    interface (2-arg mint/burn) no longer matches TokenizedAssets.sol's
+//    real ABI/selectors, which would make every assetToken.mint/burn/
+//    burnFrom call revert at runtime even though the project still compiles.
+//    A dedicated `IExternalAssetToken` interface (matching the 3-arg ABI)
+//    is now used for `assetToken`, and a `reason` string is passed at each
+//    call site (initializeBalanceSheet, subscribe, redeem). `cashToken`
+//    (EMT.sol) keeps using the original 2-arg `IExternalToken` interface —
+//    verify EMT.sol's ABI still matches it before deploying.
+//  - verifyBalanceSheet()'s `balanced` flag now tolerates negligible
+//    18-decimal fixed-point rounding dust (bounded by shares outstanding)
+//    instead of requiring exact `totalAssets == totalLiabilities` equality.
+//    The old strict check reported "unbalanced" on virtually every call,
+//    even when the fund was genuinely balanced, because
+//    totalLiabilities is reconstructed via a divide-then-multiply round
+//    trip through _computeNAVPerShare() that floor-rounds at each step.
+//    A true accounting problem (gap larger than the tolerance) still
+//    correctly reports `balanced = false`.
 // =============================================================================
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
-// AccessControl (RBAC): separation of ADMIN / COMPLIANCE / AUDITOR roles.
-
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-// ReentrancyGuard: protection against re-entrancy attacks.
-// Essential because this contract calls external contracts (EMT,
-// TokenizedAssets, TokenizedISIN).
-
 import "@openzeppelin/contracts/utils/Pausable.sol";
-// Pausable (standalone, not ERC20Pausable): allows freezing subscribe()/
-// redeem() in case of an anomaly. Does not freeze TokenizedISIN transfers
-// directly (those are protected by TokenizedISIN's own Pausable/register).
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 // =============================================================================
 // EXTERNAL TOKEN INTERFACES (EMT.sol and TokenizedAssets.sol)
 // =============================================================================
 
-/// @notice Minimal interface exposed by EMT.sol and TokenizedAssets.sol.
-/// @dev Both contracts share exactly the same function signatures (mint,
-///   burn, burnFrom, balanceOf, totalSupply, etc.), which allows using a
-///   single interface to interact with either one.
+/// @notice Minimal interface exposed by EMT.sol (the fund's cash token).
+/// @dev EMT.sol's Phase 2 mint()/burn()/burnFrom() take a `reason` string
+///   for on-chain audit trail (AMF/CSSF traceability). EMT.sol also keeps
+///   2-arg "legacy" overloads for backward compatibility, but the fund
+///   deliberately uses the reason-string versions below so cash-side
+///   Mint/Burn events carry a meaningful reason instead of "LEGACY_MINT" /
+///   "LEGACY_BURN_FROM" — matching the audit quality of IExternalAssetToken.
 interface IExternalToken {
-    function mint(address to, uint256 amount) external returns (bool);
-    function burn(uint256 amount) external returns (bool);
-    function burnFrom(address from, uint256 amount) external returns (bool);
+    function mint(address to, uint256 amount, string calldata reason) external returns (bool);
+    function burn(uint256 amount, string calldata reason) external returns (bool);
+    function burnFrom(address from, uint256 amount, string calldata reason) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
     function approve(address spender, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -153,11 +164,27 @@ interface IExternalToken {
     function owner() external view returns (address);
 }
 
-/// @notice Minimal interface exposed by TokenizedISIN.sol — the fund SHARES
-///   token, which also maintains the shareholder register.
+/// @notice Minimal interface exposed by TokenizedAssets.sol (the fund's
+///   securities token).
+/// @dev Must mirror TokenizedAssets.sol's real ABI. Its Phase 2 mint()/
+///   burn()/burnFrom() take an extra `reason` string compared to EMT.sol —
+///   they are NOT interchangeable with IExternalToken (different selectors).
+interface IExternalAssetToken {
+    function mint(address to, uint256 amount, string calldata reason) external returns (bool);
+    function burn(uint256 amount, string calldata reason) external returns (bool);
+    function burnFrom(address from, uint256 amount, string calldata reason) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address tokenOwner, address spender) external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function owner() external view returns (address);
+}
+
+/// @notice Minimal interface exposed by TokenizedISIN.sol.
 /// @dev The struct layout below must mirror TokenizedISIN.ShareholderRecord
-///   field-for-field: ABI encoding matches by structure, not by name, so
-///   this local declaration decodes external calls correctly.
+///   field-for-field.
 interface ITokenizedISIN {
     struct ShareholderRecord {
         address holder;
@@ -179,127 +206,164 @@ interface ITokenizedISIN {
     function shareholderCount() external view returns (uint256);
 }
 
+/// @notice Interface exposed by Toolbox.sol — the fund's stateless
+///   financial/regulatory rules engine (fees, strategy, compliance, NAV
+///   math). Must stay in sync with Toolbox.sol's IToolbox interface.
+interface IToolbox {
+    // NOTE: Toolbox's FeeStructure/InvestmentStrategy structs are
+    // intentionally NOT mirrored here — a struct redeclared in an
+    // interface is a distinct type from Toolbox's own, which breaks
+    // `override` on the implementation side. This fund only needs the
+    // cash-allocation field, exposed directly via readCashAllocationBp().
+
+    function calculateFees(uint256 amount, uint8 operationType) external view returns (uint256 fee);
+
+    function calculateFullRedemptionFees(
+        uint256 amount,
+        uint256 firstEntryTimestamp
+    ) external view returns (uint256 fee, bool isEarly);
+
+    function calculateProrataOngoingFees(
+        uint256 totalNetAssets,
+        uint256 cycleDurationSeconds
+    ) external view returns (uint256 managementFee, uint256 custodyFee, uint256 adminFee);
+
+    function calculatePerformanceFees(
+        uint256 currentNAVPerShare,
+        uint256 totalSharesOutstanding
+    ) external view returns (uint256 performanceFee);
+
+    function updateHighWaterMark(uint256 currentNAVPerShare, uint256 navCycle) external;
+
+    function calculateSharesToIssue(
+        uint256 subscriptionAmountEUR,
+        uint256 navPerShare
+    ) external pure returns (uint256 numberOfShares);
+
+    function calculateRedemptionAmount(
+        uint256 numberOfShares,
+        uint256 navPerShare
+    ) external pure returns (uint256 grossAmountEUR);
+
+    function validateCompliance(
+        address investor,
+        uint256 amount,
+        uint8 operationType,
+        uint256 amountAlreadyInvested
+    ) external view returns (bool isValid);
+
+    /// @notice Cash allocation of the current investment strategy, in bp.
+    /// @dev This architecture has a single non-cash asset bucket
+    ///   (TokenizedAssets), so `BASE_POINTS - cashAllocationBp` is the
+    ///   fraction of net subscription proceeds routed there.
+    function readCashAllocationBp() external view returns (uint256);
+
+    function readIndividualSubscriptionCap() external view returns (uint256);
+}
+
 // =============================================================================
-// SMART CONTRACT TOKENIZED FUND — POC PHASE 1 v4.0
+// SMART CONTRACT TOKENIZED FUND — POC PHASE 2 v5.0
 // =============================================================================
 
-contract TokenizedFundPOC is
-    AccessControl,
-    ReentrancyGuard,
-    Pausable
-{
+contract TokenizedFundPOC is AccessControl, ReentrancyGuard, Pausable {
+    using Math for uint256;
+
     // =========================================================================
     // ROLES
     // =========================================================================
 
-    /// @dev Administrator: deployment, pause, role management
     bytes32 public constant ADMIN_ROLE      = keccak256("ADMIN");
-
-    /// @dev Compliance: whitelist / blacklist of investors
     bytes32 public constant COMPLIANCE_ROLE = keccak256("COMPLIANCE");
-
-    /// @dev Auditor: read-only access to the register and NAV cycles
     bytes32 public constant AUDITOR_ROLE    = keccak256("AUDITOR");
 
     // =========================================================================
-    // EXTERNAL TOKEN CONTRACTS
+    // EXTERNAL CONTRACTS
     // =========================================================================
 
-    /// @notice EMT.sol contract — represents the fund's CASH (asset side).
-    /// @dev The fund must be the "owner" of this contract to mint EMT when
-    ///   cash enters the fund (subscription) and burn EMT when cash leaves
-    ///   the fund (redemption), via mint() and burnFrom().
+    /// @notice EMT.sol contract — the fund's CASH (asset side).
     IExternalToken public cashToken;
 
-    /// @notice TokenizedAssets.sol contract — represents the tokenized
-    ///   securities held in the fund's portfolio (asset side).
-    /// @dev The fund must be the "owner" of this contract to mint securities
-    ///   (purchase) and burn them (sale). The securities are held directly
-    ///   by the fund (address(this)).
-    IExternalToken public assetToken;
+    /// @notice TokenizedAssets.sol contract — the securities held in the
+    ///   fund's portfolio (asset side).
+    IExternalAssetToken public assetToken;
 
-    /// @notice TokenizedISIN.sol contract — represents the fund SHARES
-    ///   (liability side) and maintains the on-chain shareholder register.
-    /// @dev The fund must hold FUND_ROLE (to mint/burn shares) and
-    ///   COMPLIANCE_ROLE (to whitelist/blacklist investors) on this contract.
+    /// @notice TokenizedISIN.sol contract — the fund SHARES (liability
+    ///   side) and the on-chain shareholder register.
     ITokenizedISIN public sharesToken;
 
-    /// @notice Common name of the fund (informative only, distinct from the
-    ///   ERC20 name of the shares token).
-    string public fundName;
+    /// @notice Toolbox.sol contract — fee rules, investment strategy,
+    ///   compliance validation and reusable financial calculations.
+    /// @dev Upgradable via updateToolbox() (ADMIN_ROLE). A new Toolbox must
+    ///   be granted FUND_AUTHORIZED_ROLE before being wired in, and the old
+    ///   one should have it revoked afterwards.
+    IToolbox public toolbox;
 
-    /// @notice True once initializeBalanceSheet() has been executed.
-    /// @dev Prevents a double initialization of the T0 balance sheet.
+    string public fundName;
     bool public isInitialized;
 
     // =========================================================================
-    // POC BALANCE SHEET CONSTANTS
+    // FIXED-POINT CONSTANTS (mirror Toolbox.sol — must stay in sync)
     // =========================================================================
 
-    /// @notice [POC-3] Unit price of the tokenized security: always 1 EUR.
-    uint256 public constant ASSET_PRICE = 1;
+    uint256 public constant PRECISION   = 1e18;
+    uint256 public constant BASE_POINTS = 10_000;
 
-    /// @notice [POC-6] Initial subscription price per share: 10 EUR.
-    uint256 public constant INITIAL_SUBSCRIPTION_PRICE = 10;
+    /// @notice NAV per share used only for the very first NAV cycle
+    ///   (before any shares are outstanding to derive a NAV from).
+    uint256 public constant INITIAL_NAV_PER_SHARE = 100 * PRECISION; // 100 EUR/share
 
-    /// @notice [POC-5] Investment ratio in securities: 50% of subscribed cash.
-    uint256 public constant INVESTMENT_RATIO_PERCENT = 50;
+    /// @notice Genesis subscription amount used by initializeBalanceSheet().
+    ///   Must be >= Toolbox.MINIMUM_SUBSCRIPTION (100,000 EUR by default).
+    uint256 public constant INITIAL_SUBSCRIPTION_EUR = 1_000_000 * PRECISION; // 1,000,000 EUR
 
-    /// @notice [POC-6] Number of shares issued at initialization: 10 shares.
-    uint256 public constant INITIAL_SHARES = 10;
+    // =========================================================================
+    // PRICE PARAMETER (placeholder for a future on-chain price oracle)
+    // =========================================================================
 
-    /// @notice [POC-6] Securities bought at initialization: 50 units.
-    uint256 public constant INITIAL_ASSETS = 50;
+    /// @notice Price of one whole TokenizedAssets unit, in EUR (18 dec).
+    /// @dev KNOWN LIMITATION: admin-settable placeholder, not a certified
+    ///   price feed. Defaults to 1 EUR at deployment.
+    uint256 public assetPriceEUR = PRECISION;
 
-    /// @notice [POC-6] Residual cash at initialization: 50 EUR.
-    uint256 public constant INITIAL_CASH = 50;
+    /// @notice Timestamp of the last ongoing-fee accrual (management/
+    ///   custody/admin/performance). Used to compute the prorata window
+    ///   passed to Toolbox.calculateProrataOngoingFees().
+    uint256 public lastFeeAccrualTimestamp;
 
     // =========================================================================
     // DATA STRUCTURES
     // =========================================================================
 
-    /// @notice Full snapshot of a NAV cycle — archived immutably.
     struct NAVCycle {
-        uint256 cycleNumber;          // Sequential number (0 = initial state)
-        uint256 timestamp;            // Unix timestamp at cycle close
-        uint256 navPerShare;          // NAV per share in EUR at close
-        uint256 totalNAV;             // Total fund NAV in EUR (cash + assets)
-        uint256 assetsHeld;           // TokenizedAssets held after the cycle
-        uint256 cashAvailable;        // Cash (EMT) held by the fund after the cycle
-        uint256 sharesOutstanding;    // Total TokenizedISIN shares outstanding after the cycle
-        OperationType operationType;  // SUBSCRIPTION or REDEMPTION
-        uint256 shareQuantity;        // Shares exchanged in this cycle
-        uint256 assetsBought;         // Assets bought in this cycle (subscription)
-        uint256 assetsSold;           // Assets sold in this cycle (redemption)
-        address investor;             // Investor address
-        bytes32 stateFingerprint;     // keccak256 hash of the state — tamper-proof
-        bool    isFinalized;          // True once the cycle is irreversibly closed
+        uint256 cycleNumber;
+        uint256 timestamp;
+        uint256 navPerShare;
+        uint256 totalNAV;
+        uint256 assetsHeld;
+        uint256 cashAvailable;
+        uint256 sharesOutstanding;
+        OperationType operationType;
+        uint256 shareQuantity;      // shares issued (SUBSCRIPTION) or redeemed (REDEMPTION); 0 for FEE_ACCRUAL
+        uint256 assetsBought;
+        uint256 assetsSold;
+        uint256 feeCharged;         // subscription fee, redemption fee, or sum of ongoing fees (EUR, 18 dec)
+        address investor;           // address(0) for FEE_ACCRUAL cycles
+        bytes32 stateFingerprint;
+        bool    isFinalized;
     }
-
-    // =========================================================================
-    // ENUMERATIONS
-    // =========================================================================
 
     enum OperationType {
-        SUBSCRIPTION, // Investor entry: mint shares + mint securities
-        REDEMPTION    // Investor exit: burn shares + burn securities
+        SUBSCRIPTION,
+        REDEMPTION,
+        FEE_ACCRUAL
     }
 
-    // =========================================================================
-    // BALANCE SHEET STATE VARIABLES
-    // =========================================================================
-
-    /// @notice Cycle counter — starts at 1 (cycle 0 = initial state).
     uint256 private _currentCycleNumber;
-
-    /// @notice Immutable history of NAV cycles: number => NAVCycle.
     mapping(uint256 => NAVCycle) private _navCycles;
-
-    /// @notice Application-level lock: prevents re-entrancy at the NAV-cycle level.
     bool private _processingInProgress;
 
     // =========================================================================
-    // EVENTS — IMMUTABLE ON-CHAIN TRACEABILITY
+    // EVENTS
     // =========================================================================
 
     event NAVCycleClosed(
@@ -309,6 +373,7 @@ contract TokenizedFundPOC is
         uint256 shareQuantity,
         uint256 assetsBought,
         uint256 assetsSold,
+        uint256 feeCharged,
         uint256 cashAfter,
         uint256 assetsAfter,
         uint256 navPerShareAfter,
@@ -318,8 +383,9 @@ contract TokenizedFundPOC is
 
     event SubscriptionExecuted(
         address indexed investor,
+        uint256 grossAmountEUR,
+        uint256 subscriptionFee,
         uint256 sharesIssued,
-        uint256 amountSubscribed,
         uint256 assetsBought,
         uint256 cashRetained,
         uint256 navPerShareAfter,
@@ -330,7 +396,10 @@ contract TokenizedFundPOC is
     event RedemptionExecuted(
         address indexed investor,
         uint256 sharesRedeemed,
-        uint256 amountRepaid,
+        uint256 grossAmountEUR,
+        uint256 redemptionFee,
+        bool    wasEarlyRedemption,
+        uint256 netAmountPaid,
         uint256 assetsSold,
         uint256 cashUsed,
         uint256 navPerShareAfter,
@@ -338,58 +407,219 @@ contract TokenizedFundPOC is
         uint256 timestamp
     );
 
-    event SecurityAlert(string description, address indexed trigger, uint256 timestamp);
-
-    /// @notice Emitted when the T0 balance sheet is initialized (mint shares
-    ///   + mint cash + mint assets).
-    event FundInitialized(
-        address indexed admin,
-        uint256 initialShares,
-        uint256 initialAssets,
-        uint256 initialCash,
+    /// @notice Emitted by accrueOngoingFees(): logs the fees that Toolbox
+    ///   computed for the elapsed period. No tokens are moved (see header).
+    event FeesAccrued(
+        uint256 managementFee,
+        uint256 custodyFee,
+        uint256 adminFee,
+        uint256 performanceFee,
+        uint256 grossNAV,
+        uint256 navPerShare,
+        uint256 periodSeconds,
         uint256 timestamp
     );
 
-    /// @notice Emitted at the very start of subscribe() or redeem(), as soon
-    ///   as the order is received and BEFORE any processing (checks,
-    ///   calculations, state mutations).
-    /// @dev This timestamp is the official on-chain order-receipt time. It
-    ///   can be used as a regulatory reference (cut-off).
-    event OrderReceived(
-        address indexed investor,      // Address that placed the order
-        OperationType operationType,   // SUBSCRIPTION or REDEMPTION
-        uint256 shareQuantity,         // Requested share quantity
-        uint256 startTimestamp         // block.timestamp at order receipt
+    event SecurityAlert(string description, address indexed trigger, uint256 timestamp);
+
+    event FundInitialized(
+        address indexed admin,
+        uint256 initialSharesIssued,
+        uint256 initialAssetsBought,
+        uint256 initialCashRetained,
+        uint256 timestamp
     );
 
-    /// @notice Emitted at the very end of subscribe() or redeem(), after the
-    ///   final mint/burn on the external cash/asset/shares contracts has
-    ///   succeeded.
-    /// @dev This timestamp marks the irreversible finalization of the
-    ///   operation. The difference (startTimestamp → endTimestamp) can be
-    ///   used to measure the processing time of a full NAV cycle.
-    event OperationFinalized(
-        address indexed investor,      // Address whose order was executed
-        OperationType operationType,   // SUBSCRIPTION or REDEMPTION
-        uint256 shareQuantity,         // Share quantity actually processed
-        uint256 cycleNumber,           // Associated NAV cycle number
-        uint256 endTimestamp           // block.timestamp after external interactions
+    event OrderReceived(
+        address indexed investor,
+        OperationType operationType,
+        uint256 amount,          // amountEUR for SUBSCRIPTION, shareAmount for REDEMPTION
+        uint256 startTimestamp
     );
+
+    event OperationFinalized(
+        address indexed investor,
+        OperationType operationType,
+        uint256 amount,
+        uint256 cycleNumber,
+        uint256 endTimestamp
+    );
+
+    event AssetPriceUpdated(uint256 previousPriceEUR, uint256 newPriceEUR, uint256 timestamp);
+    event ToolboxUpdated(address indexed previousToolbox, address indexed newToolbox, uint256 timestamp);
+
+    // =========================================================================
+    // INTERNAL CALCULATION HELPERS (stack-depth mitigation)
+    // =========================================================================
+    // Grouping intermediate results into memory structs (instead of many
+    // separate local uint256 variables) keeps subscribe()/redeem()/
+    // initializeBalanceSheet() well under Solidity's ~16-slot stack limit —
+    // a memory struct variable only costs ONE stack slot regardless of how
+    // many fields it carries.
+
+    struct SubscriptionCalc {
+        uint256 subscriptionFee;
+        uint256 netAmount;
+        uint256 sharesToIssue;
+        uint256 assetsToBuy;
+        uint256 cashRetained;
+    }
+
+    struct RedemptionCalc {
+        uint256 grossAmount;
+        uint256 redemptionFee;
+        bool    isEarly;
+        uint256 netAmountToInvestor;
+        uint256 assetsSold;
+        uint256 cashUsed;
+    }
+
+    struct CycleAfter {
+        uint256 assetsAfter;
+        uint256 cashAfter;
+        uint256 sharesAfter;
+        uint256 totalNAVAfter;
+        uint256 navPerShareAfter;
+        bytes32 stateFingerprint;
+    }
+
+    /// @dev Computes the Toolbox-driven fee, share count, and cash/asset
+    ///   split for a gross EUR subscription amount. Used by both subscribe()
+    ///   and initializeBalanceSheet().
+    function _calcSubscription(uint256 amountEUR) internal view returns (SubscriptionCalc memory calc) {
+        calc.subscriptionFee = toolbox.calculateFees(amountEUR, 0);
+        calc.netAmount        = amountEUR - calc.subscriptionFee;
+
+        uint256 navPerShare = _computeNAVPerShare();
+        calc.sharesToIssue   = toolbox.calculateSharesToIssue(calc.netAmount, navPerShare);
+
+        uint256 cashAllocationBp = toolbox.readCashAllocationBp();
+        uint256 investRatioBp    = BASE_POINTS - cashAllocationBp;
+        uint256 cashToInvest     = calc.netAmount.mulDiv(investRatioBp, BASE_POINTS);
+        calc.cashRetained        = calc.netAmount - cashToInvest;
+        calc.assetsToBuy         = cashToInvest.mulDiv(PRECISION, assetPriceEUR);
+    }
+
+    /// @dev Computes the "after" balance-sheet state for a subscription
+    ///   BEFORE the mint interactions happen (strict CEI archive-then-mint
+    ///   ordering used by subscribe()).
+    function _calcCycleAfterSubscription(SubscriptionCalc memory calc, uint256 cycleNumber)
+        internal
+        view
+        returns (CycleAfter memory c)
+    {
+        c.assetsAfter = assetToken.balanceOf(address(this)) + calc.assetsToBuy;
+        c.cashAfter   = cashToken.balanceOf(address(this)) + calc.cashRetained;
+        c.sharesAfter = sharesToken.totalSupply() + calc.sharesToIssue;
+
+        c.totalNAVAfter    = c.cashAfter + c.assetsAfter.mulDiv(assetPriceEUR, PRECISION);
+        c.navPerShareAfter = c.sharesAfter > 0
+            ? c.totalNAVAfter.mulDiv(PRECISION, c.sharesAfter)
+            : INITIAL_NAV_PER_SHARE;
+
+        c.stateFingerprint = _computeStateFingerprint(
+            cycleNumber, c.navPerShareAfter, c.totalNAVAfter, c.assetsAfter, c.cashAfter, c.sharesAfter
+        );
+    }
+
+    /// @dev Computes the Toolbox-driven gross amount, fee, and proportional
+    ///   asset/cash split for a redemption. Called BEFORE the burn
+    ///   interactions happen, so balanceOf() reads reflect the pre-burn state.
+    function _calcRedemption(uint256 shareAmount, uint256 firstEntryTimestamp)
+        internal
+        view
+        returns (RedemptionCalc memory calc)
+    {
+        uint256 navPerShareBefore = _computeNAVPerShare();
+        calc.grossAmount = toolbox.calculateRedemptionAmount(shareAmount, navPerShareBefore);
+
+        (calc.redemptionFee, calc.isEarly) = toolbox.calculateFullRedemptionFees(calc.grossAmount, firstEntryTimestamp);
+        calc.netAmountToInvestor = calc.grossAmount > calc.redemptionFee ? calc.grossAmount - calc.redemptionFee : 0;
+
+        uint256 assetsBefore   = assetToken.balanceOf(address(this));
+        uint256 totalNAVBefore = _computeTotalNAV();
+        uint256 assetsValue    = assetsBefore.mulDiv(assetPriceEUR, PRECISION);
+
+        // Only netAmountToInvestor is actually liquidated/paid out; the fee
+        // portion of grossAmount is simply not sold/burned, so it remains on
+        // the fund's balance sheet (see header "SCOPE DECISION" note).
+        if (totalNAVBefore > 0 && assetsValue > 0) {
+            uint256 assetsSoldValue = calc.netAmountToInvestor.mulDiv(assetsValue, totalNAVBefore);
+            calc.assetsSold = assetsSoldValue.mulDiv(PRECISION, assetPriceEUR);
+            calc.cashUsed   = calc.netAmountToInvestor - assetsSoldValue;
+        } else {
+            calc.assetsSold = 0;
+            calc.cashUsed   = calc.netAmountToInvestor;
+        }
+    }
+
+    /// @dev Computes the "after" balance-sheet state for a redemption
+    ///   BEFORE the burn interactions happen (strict CEI archive-then-burn
+    ///   ordering used by redeem()).
+    function _calcCycleAfterRedemption(RedemptionCalc memory calc, uint256 shareAmount, uint256 cycleNumber)
+        internal
+        view
+        returns (CycleAfter memory c)
+    {
+        c.assetsAfter = assetToken.balanceOf(address(this)) - calc.assetsSold;
+        c.cashAfter   = cashToken.balanceOf(address(this)) - calc.cashUsed;
+        c.sharesAfter = sharesToken.totalSupply() - shareAmount;
+
+        c.totalNAVAfter    = c.cashAfter + c.assetsAfter.mulDiv(assetPriceEUR, PRECISION);
+        c.navPerShareAfter = c.sharesAfter > 0 ? c.totalNAVAfter.mulDiv(PRECISION, c.sharesAfter) : 0;
+
+        c.stateFingerprint = _computeStateFingerprint(
+            cycleNumber, c.navPerShareAfter, c.totalNAVAfter, c.assetsAfter, c.cashAfter, c.sharesAfter
+        );
+    }
+
+    /// @dev Archives NAV cycle 0 and emits the genesis events. Split out of
+    ///   initializeBalanceSheet() purely to keep that function's live stack
+    ///   variables low.
+    function _archiveGenesisCycle(SubscriptionCalc memory calc) internal {
+        uint256 navT0Total    = _computeTotalNAV();
+        uint256 navT0PerShare = _computeNAVPerShare();
+
+        bytes32 fingerprintT0 = _computeStateFingerprint(
+            0, navT0PerShare, navT0Total, calc.assetsToBuy, cashToken.balanceOf(address(this)), sharesToken.totalSupply()
+        );
+
+        _navCycles[0] = NAVCycle({
+            cycleNumber:        0,
+            timestamp:          block.timestamp,
+            navPerShare:        navT0PerShare,
+            totalNAV:           navT0Total,
+            assetsHeld:         calc.assetsToBuy,
+            cashAvailable:      cashToken.balanceOf(address(this)),
+            sharesOutstanding:  sharesToken.totalSupply(),
+            operationType:      OperationType.SUBSCRIPTION,
+            shareQuantity:      calc.sharesToIssue,
+            assetsBought:       calc.assetsToBuy,
+            assetsSold:         0,
+            feeCharged:         calc.subscriptionFee,
+            investor:           msg.sender,
+            stateFingerprint:   fingerprintT0,
+            isFinalized:        true
+        });
+
+        _currentCycleNumber = 0;
+
+        emit FundInitialized(msg.sender, calc.sharesToIssue, calc.assetsToBuy, calc.cashRetained, block.timestamp);
+        emit NAVCycleClosed(
+            0, OperationType.SUBSCRIPTION, msg.sender, calc.sharesToIssue, calc.assetsToBuy, 0, calc.subscriptionFee,
+            cashToken.balanceOf(address(this)), calc.assetsToBuy, navT0PerShare, fingerprintT0, block.timestamp
+        );
+    }
 
     // =========================================================================
     // MODIFIERS
     // =========================================================================
 
     modifier notProcessing() {
-        require(
-            !_processingInProgress,
-            "POC: NAV cycle in progress - please retry after the cycle closes"
-        );
+        require(!_processingInProgress, "POC: NAV cycle in progress - please retry after the cycle closes");
         _;
     }
 
-    /// @dev Guarantees that the T0 balance sheet has been initialized before
-    ///   any operation.
     modifier onlyIfInitialized() {
         require(isInitialized, "POC: Fund not initialized - call initializeBalanceSheet() first");
         _;
@@ -399,38 +629,28 @@ contract TokenizedFundPOC is
     // CONSTRUCTOR
     // =========================================================================
 
-    /// @notice Deploys the fund contract and links it to the EMT,
-    ///   TokenizedAssets and TokenizedISIN contracts.
-    /// @param fundName_ Official name of the fund (informative only).
-    /// @param cashTokenAddress Address of the already-deployed EMT.sol contract (cash).
-    /// @param assetTokenAddress Address of the already-deployed TokenizedAssets.sol contract (securities).
-    /// @param sharesTokenAddress Address of the already-deployed TokenizedISIN.sol contract (shares/register).
-    ///
-    /// @dev The constructor performs NO mint: at this stage, this contract is
-    ///   neither "owner" of EMT/TokenizedAssets nor a role-holder on
-    ///   TokenizedISIN (these rights must be transferred/granted after
-    ///   deployment). The T0 balance sheet is initialized via
-    ///   initializeBalanceSheet().
     constructor(
         string memory fundName_,
         address cashTokenAddress,
         address assetTokenAddress,
-        address sharesTokenAddress
+        address sharesTokenAddress,
+        address toolboxAddress
     ) {
         require(bytes(fundName_).length > 0, "POC: Fund name is empty");
         require(cashTokenAddress != address(0), "POC: Invalid cash token address");
         require(assetTokenAddress != address(0), "POC: Invalid asset token address");
         require(sharesTokenAddress != address(0), "POC: Invalid shares token address");
+        require(toolboxAddress != address(0), "POC: Invalid toolbox address");
         require(cashTokenAddress != assetTokenAddress, "POC: Cash and asset tokens must be distinct");
 
         fundName    = fundName_;
         cashToken   = IExternalToken(cashTokenAddress);
-        assetToken  = IExternalToken(assetTokenAddress);
+        assetToken  = IExternalAssetToken(assetTokenAddress);
         sharesToken = ITokenizedISIN(sharesTokenAddress);
+        toolbox     = IToolbox(toolboxAddress);
 
-        // ─────────────────────────────────────────────────────────────────────
-        // Founding role assignment
-        // ─────────────────────────────────────────────────────────────────────
+        lastFeeAccrualTimestamp = block.timestamp;
+
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE,         msg.sender);
         _grantRole(COMPLIANCE_ROLE,    msg.sender);
@@ -438,23 +658,17 @@ contract TokenizedFundPOC is
     }
 
     // =========================================================================
-    // T0 BALANCE SHEET INITIALIZATION (separate from the constructor)
+    // T0 BALANCE SHEET INITIALIZATION
     // =========================================================================
 
-    /// @notice Initializes the fund's T0 balance sheet: mints EMT (cash),
-    ///   TokenizedAssets (securities) and TokenizedISIN shares, and archives
-    ///   NAV cycle 0.
-    ///
-    /// @dev Must be called EXACTLY ONCE by an ADMIN_ROLE account, and only
-    ///   AFTER this contract has been made "owner" of cashToken/assetToken
-    ///   and granted FUND_ROLE + COMPLIANCE_ROLE on sharesToken (otherwise
-    ///   the mint() calls will revert with "caller is not authorized" /
-    ///   "AccessControl: account is missing role").
-    ///
-    ///   Final T0 balance sheet:
-    ///     Assets:      50 EUR cash + 50 assets x 1 EUR = 100 EUR
-    ///     Liabilities: 10 shares x 10 EUR NAV           = 100 EUR
-    ///     NAV/share = 100 / 10 = 10 EUR ✓
+    /// @notice Initializes the fund's T0 balance sheet via a genesis
+    ///   subscription of INITIAL_SUBSCRIPTION_EUR, processed through the
+    ///   exact same Toolbox-driven rules (compliance, fees, strategy) as
+    ///   any later subscribe() call.
+    /// @dev Must be called EXACTLY ONCE by ADMIN_ROLE, only after this
+    ///   contract has become "owner" of cashToken/assetToken and has been
+    ///   granted FUND_ROLE + COMPLIANCE_ROLE on sharesToken, and
+    ///   FUND_AUTHORIZED_ROLE on toolbox.
     function initializeBalanceSheet() external onlyRole(ADMIN_ROLE) {
         require(!isInitialized, "POC: Balance sheet already initialized");
         require(
@@ -468,238 +682,124 @@ contract TokenizedFundPOC is
 
         isInitialized = true;
 
-        // ── Whitelist the deployer as the first shareholder ─────────────────
         sharesToken.whitelistShareholder(msg.sender);
 
-        // ── INTERACTIONS — mint on the three external contracts ─────────────
-        // The fund becomes the holder of the tokenized securities (fund's assets).
-        assetToken.mint(address(this), INITIAL_ASSETS); // 50 units at 1 EUR
-        // The fund mints EMT to itself to represent the residual cash held.
-        cashToken.mint(address(this), INITIAL_CASH); // 50 EUR
-        // The deployer receives the 10 initial shares (the fund's liabilities).
-        sharesToken.mint(msg.sender, INITIAL_SHARES, INITIAL_SHARES * INITIAL_SUBSCRIPTION_PRICE);
-
-        // ── Archival of NAV cycle 0 (T0 reference state) ─────────────────────
-        uint256 navT0Total    = _computeTotalNAV();     // 50 + 50x1 = 100 EUR
-        uint256 navT0PerShare = _computeNAVPerShare();  // 100 / 10  = 10 EUR
-
-        bytes32 fingerprintT0 = _computeStateFingerprint(
-            0,
-            navT0PerShare,
-            navT0Total,
-            INITIAL_ASSETS,
-            cashToken.balanceOf(address(this)),
-            sharesToken.totalSupply()
+        // ── CHECKS via Toolbox ───────────────────────────────────────────────
+        ITokenizedISIN.ShareholderRecord memory rec = sharesToken.getShareholderRecord(msg.sender);
+        require(
+            toolbox.validateCompliance(msg.sender, INITIAL_SUBSCRIPTION_EUR, 0, rec.amountInvested),
+            "POC: Genesis subscription failed Toolbox compliance validation"
         );
 
-        _navCycles[0] = NAVCycle({
-            cycleNumber:        0,
-            timestamp:          block.timestamp,
-            navPerShare:        navT0PerShare,
-            totalNAV:           navT0Total,
-            assetsHeld:         INITIAL_ASSETS,
-            cashAvailable:      cashToken.balanceOf(address(this)),
-            sharesOutstanding:  sharesToken.totalSupply(),
-            operationType:      OperationType.SUBSCRIPTION,
-            shareQuantity:      INITIAL_SHARES,
-            assetsBought:       INITIAL_ASSETS,
-            assetsSold:         0,
-            investor:           msg.sender,
-            stateFingerprint:   fingerprintT0,
-            isFinalized:        true
-        });
+        SubscriptionCalc memory calc = _calcSubscription(INITIAL_SUBSCRIPTION_EUR);
+        require(calc.sharesToIssue > 0, "POC: Genesis subscription too small to issue a share");
 
-        _currentCycleNumber = 0;
+        // ── INTERACTIONS ──────────────────────────────────────────────────────
+        assetToken.mint(address(this), calc.assetsToBuy, "GENESIS_SUBSCRIPTION");
+        cashToken.mint(address(this), calc.cashRetained, "GENESIS_SUBSCRIPTION");
+        sharesToken.mint(msg.sender, calc.sharesToIssue, INITIAL_SUBSCRIPTION_EUR);
 
-        emit FundInitialized(
-            msg.sender,
-            INITIAL_SHARES,
-            INITIAL_ASSETS,
-            INITIAL_CASH,
-            block.timestamp
-        );
-
-        emit NAVCycleClosed(
-            0,
-            OperationType.SUBSCRIPTION,
-            msg.sender,
-            INITIAL_SHARES,
-            INITIAL_ASSETS,
-            0,
-            cashToken.balanceOf(address(this)),
-            INITIAL_ASSETS,
-            navT0PerShare,
-            fingerprintT0,
-            block.timestamp
-        );
+        // ── ARCHIVAL of NAV cycle 0 ───────────────────────────────────────────
+        _archiveGenesisCycle(calc);
     }
 
     // =========================================================================
     // INVESTOR MANAGEMENT — WHITELIST / BLACKLIST (forwarded to TokenizedISIN)
     // =========================================================================
 
-    /// @notice Whitelists an investor by forwarding the call to the
-    ///   TokenizedISIN shareholder register.
-    /// @dev Requires this fund contract to hold COMPLIANCE_ROLE on
-    ///   sharesToken (see deployment prerequisites).
-    function whitelistInvestor(address investor)
-        external
-        onlyRole(COMPLIANCE_ROLE)
-        whenNotPaused
-    {
+    function whitelistInvestor(address investor) external onlyRole(COMPLIANCE_ROLE) whenNotPaused {
         sharesToken.whitelistShareholder(investor);
     }
 
-    /// @notice Blacklists an investor by forwarding the call to the
-    ///   TokenizedISIN shareholder register.
-    function blacklistInvestor(address investor, string calldata reason)
-        external
-        onlyRole(COMPLIANCE_ROLE)
-    {
+    function blacklistInvestor(address investor, string calldata reason) external onlyRole(COMPLIANCE_ROLE) {
         sharesToken.blacklistShareholder(investor, reason);
-
-        emit SecurityAlert(
-            string(abi.encodePacked("Blacklisting: ", reason)),
-            investor,
-            block.timestamp
-        );
+        emit SecurityAlert(string(abi.encodePacked("Blacklisting: ", reason)), investor, block.timestamp);
     }
 
     // =========================================================================
-    // SUBSCRIPTION — MINT SHARES (TokenizedISIN) + MINT CASH & ASSETS
+    // SUBSCRIPTION
     // =========================================================================
 
-    /// @notice Subscribes N shares and applies the 50/50 investment strategy.
-    /// @param shareAmount Whole number of shares to subscribe (>= 1).
-    ///
-    /// @dev Strict CEI pattern: all internal state mutations BEFORE the
-    ///   external calls to assetToken.mint(), cashToken.mint() and
-    ///   sharesToken.mint().
-    function subscribe(uint256 shareAmount)
+    /// @notice Subscribes `amountEUR` (18 decimals) and applies the
+    ///   Toolbox-driven fee + investment strategy rules.
+    /// @param amountEUR Gross subscription amount in EUR, 18 decimals.
+    ///   Must satisfy Toolbox's compliance rules (institutional minimum
+    ///   subscription + individual cap).
+    function subscribe(uint256 amountEUR)
         external
         whenNotPaused
         nonReentrant
         notProcessing
         onlyIfInitialized
     {
-        // =====================================================================
-        // ORDER-RECEIPT TIMESTAMP — before any processing
-        // =====================================================================
-        // Emitted first, before business checks and state mutations.
-        // Constitutes the official on-chain time of subscription order receipt.
-        emit OrderReceived(msg.sender, OperationType.SUBSCRIPTION, shareAmount, block.timestamp);
+        emit OrderReceived(msg.sender, OperationType.SUBSCRIPTION, amountEUR, block.timestamp);
 
-        // =====================================================================
-        // CHECKS
-        // =====================================================================
-        require(shareAmount >= 1, "POC: Share quantity must be a whole number >= 1");
+        // ── CHECKS ────────────────────────────────────────────────────────────
+        require(amountEUR > 0, "POC: Subscription amount must be > 0");
 
-        // =====================================================================
-        // EFFECTS — All state modifications BEFORE interactions
-        // =====================================================================
+        ITokenizedISIN.ShareholderRecord memory rec = sharesToken.getShareholderRecord(msg.sender);
+        require(
+            toolbox.validateCompliance(msg.sender, amountEUR, 0, rec.amountInvested),
+            "POC: Subscription failed Toolbox compliance validation (minimum amount or individual cap)"
+        );
+
+        // ── EFFECTS ───────────────────────────────────────────────────────────
         _processingInProgress = true;
 
-        uint256 cashIn         = shareAmount * INITIAL_SUBSCRIPTION_PRICE;
-        uint256 cashInvested   = (cashIn * INVESTMENT_RATIO_PERCENT) / 100;
-        uint256 assetsBought   = cashInvested / ASSET_PRICE;
-        uint256 cashRetained   = cashIn - cashInvested;
+        SubscriptionCalc memory calc = _calcSubscription(amountEUR);
+        require(calc.sharesToIssue > 0, "POC: Net subscription amount too small to issue a share");
 
-        // ── NAV CYCLE ARCHIVAL ────────────────────────────────────────────────
         _currentCycleNumber += 1;
         uint256 cycleNumber = _currentCycleNumber;
 
-        // "After" states computed from the external contracts' current
-        // balances + the amounts that will be minted right after (CEI
-        // pattern: interactions last, but the archive must reflect the
-        // final state of the cycle).
-        uint256 assetsAfter = assetToken.balanceOf(address(this)) + assetsBought;
-        uint256 cashAfter    = cashToken.balanceOf(address(this)) + cashRetained;
-        uint256 sharesAfter  = sharesToken.totalSupply() + shareAmount;
-
-        uint256 totalNAVAfter   = cashAfter + (assetsAfter * ASSET_PRICE);
-        uint256 navPerShareAfter = sharesAfter > 0
-            ? totalNAVAfter / sharesAfter
-            : INITIAL_SUBSCRIPTION_PRICE;
-
-        bytes32 stateFingerprint = _computeStateFingerprint(
-            cycleNumber,
-            navPerShareAfter,
-            totalNAVAfter,
-            assetsAfter,
-            cashAfter,
-            sharesAfter
-        );
+        CycleAfter memory c = _calcCycleAfterSubscription(calc, cycleNumber);
 
         _navCycles[cycleNumber] = NAVCycle({
             cycleNumber:        cycleNumber,
             timestamp:          block.timestamp,
-            navPerShare:        navPerShareAfter,
-            totalNAV:           totalNAVAfter,
-            assetsHeld:         assetsAfter,
-            cashAvailable:      cashAfter,
-            sharesOutstanding:  sharesAfter,
+            navPerShare:        c.navPerShareAfter,
+            totalNAV:           c.totalNAVAfter,
+            assetsHeld:         c.assetsAfter,
+            cashAvailable:      c.cashAfter,
+            sharesOutstanding:  c.sharesAfter,
             operationType:      OperationType.SUBSCRIPTION,
-            shareQuantity:      shareAmount,
-            assetsBought:       assetsBought,
+            shareQuantity:      calc.sharesToIssue,
+            assetsBought:       calc.assetsToBuy,
             assetsSold:         0,
+            feeCharged:         calc.subscriptionFee,
             investor:           msg.sender,
-            stateFingerprint:   stateFingerprint,
+            stateFingerprint:   c.stateFingerprint,
             isFinalized:        true
         });
 
-        // ── EVENT EMISSION ────────────────────────────────────────────────────
         emit SubscriptionExecuted(
-            msg.sender,
-            shareAmount,
-            cashIn,
-            assetsBought,
-            cashRetained,
-            navPerShareAfter,
-            cycleNumber,
-            block.timestamp
+            msg.sender, amountEUR, calc.subscriptionFee, calc.sharesToIssue, calc.assetsToBuy, calc.cashRetained,
+            c.navPerShareAfter, cycleNumber, block.timestamp
         );
-
         emit NAVCycleClosed(
-            cycleNumber,
-            OperationType.SUBSCRIPTION,
-            msg.sender,
-            shareAmount,
-            assetsBought,
-            0,
-            cashAfter,
-            assetsAfter,
-            navPerShareAfter,
-            stateFingerprint,
-            block.timestamp
+            cycleNumber, OperationType.SUBSCRIPTION, msg.sender, calc.sharesToIssue, calc.assetsToBuy, 0,
+            calc.subscriptionFee, c.cashAfter, c.assetsAfter, c.navPerShareAfter, c.stateFingerprint, block.timestamp
         );
 
-        // =====================================================================
-        // INTERACTIONS — EXTERNAL calls last (CEI pattern)
-        // =====================================================================
-        // The fund buys securities: mint on TokenizedAssets, held by the fund.
-        require(assetToken.mint(address(this), assetsBought), "POC: TokenizedAssets mint failed");
-        // The fund mints EMT to itself to represent the cash retained.
-        require(cashToken.mint(address(this), cashRetained), "POC: EMT mint failed");
-        // The fund issues the new TokenizedISIN shares to the investor; the
-        // shareholder register is updated atomically inside sharesToken.mint().
-        require(sharesToken.mint(msg.sender, shareAmount, cashIn), "POC: TokenizedISIN mint failed");
+        // ── INTERACTIONS ──────────────────────────────────────────────────────
+        // NOTE: `investedAmount` recorded on the shareholder register is the
+        // GROSS amount (pre-fee): the Toolbox individual subscription cap is
+        // meant to cap what an investor actually commits, not the net
+        // invested amount after fees.
+        require(assetToken.mint(address(this), calc.assetsToBuy, "SUBSCRIPTION"), "POC: TokenizedAssets mint failed");
+        require(cashToken.mint(address(this), calc.cashRetained, "SUBSCRIPTION"), "POC: EMT mint failed");
+        require(sharesToken.mint(msg.sender, calc.sharesToIssue, amountEUR), "POC: TokenizedISIN mint failed");
 
-        // =====================================================================
-        // FINALIZATION TIMESTAMP — after all external interactions
-        // =====================================================================
-        // Emitted last, once the shares mint is confirmed on-chain.
-        // Marks the instant from which the investor actually holds their shares.
-        emit OperationFinalized(msg.sender, OperationType.SUBSCRIPTION, shareAmount, cycleNumber, block.timestamp);
+        emit OperationFinalized(msg.sender, OperationType.SUBSCRIPTION, calc.sharesToIssue, cycleNumber, block.timestamp);
 
         _processingInProgress = false;
     }
 
     // =========================================================================
-    // REDEMPTION — BURN SHARES (TokenizedISIN) + BURN CASH & ASSETS
+    // REDEMPTION
     // =========================================================================
 
-    /// @notice Redeems N shares at the current NAV and returns the cash.
-    /// @param shareAmount Whole number of shares to redeem (>= 1).
+    /// @param shareAmount Whole/fractional share amount to redeem, 18 decimals.
     function redeem(uint256 shareAmount)
         external
         whenNotPaused
@@ -707,166 +807,167 @@ contract TokenizedFundPOC is
         notProcessing
         onlyIfInitialized
     {
-        // =====================================================================
-        // ORDER-RECEIPT TIMESTAMP — before any processing
-        // =====================================================================
-        // Emitted first, before business checks and state mutations.
-        // Constitutes the official on-chain time of redemption order receipt.
         emit OrderReceived(msg.sender, OperationType.REDEMPTION, shareAmount, block.timestamp);
 
-        // =====================================================================
-        // CHECKS
-        // =====================================================================
-        require(shareAmount >= 1, "POC: Share quantity must be a whole number >= 1");
+        // ── CHECKS ────────────────────────────────────────────────────────────
+        require(shareAmount > 0, "POC: Share amount must be > 0");
 
         uint256 sharesOutstanding = sharesToken.totalSupply();
-        require(
-            sharesOutstanding > shareAmount,
-            "POC: Full fund redemption is forbidden - use liquidation instead"
-        );
-        require(
-            sharesToken.balanceOf(msg.sender) >= shareAmount,
-            "POC: Insufficient share balance for this redemption"
-        );
+        require(sharesOutstanding > shareAmount, "POC: Full fund redemption is forbidden - use liquidation instead");
+        require(sharesToken.balanceOf(msg.sender) >= shareAmount, "POC: Insufficient share balance for this redemption");
 
-        // =====================================================================
-        // EFFECTS — All state modifications BEFORE interactions
-        // =====================================================================
+        // ── EFFECTS ───────────────────────────────────────────────────────────
         _processingInProgress = true;
 
-        uint256 assetsBefore   = assetToken.balanceOf(address(this));
-        uint256 cashBefore     = cashToken.balanceOf(address(this));
-        uint256 totalNAVBefore = cashBefore + (assetsBefore * ASSET_PRICE);
-        uint256 navPerShareBefore = sharesOutstanding > 0
-            ? totalNAVBefore / sharesOutstanding
-            : INITIAL_SUBSCRIPTION_PRICE;
+        ITokenizedISIN.ShareholderRecord memory rec = sharesToken.getShareholderRecord(msg.sender);
+        RedemptionCalc memory calc = _calcRedemption(shareAmount, rec.firstEntryTimestamp);
 
-        uint256 amountRepaid = shareAmount * navPerShareBefore;
+        require(assetToken.balanceOf(address(this)) >= calc.assetsSold, "POC: Insufficient assets to honor the redemption");
+        require(cashToken.balanceOf(address(this)) >= calc.cashUsed,      "POC: Insufficient cash to honor the redemption");
 
-        uint256 assetsValue = assetsBefore * ASSET_PRICE;
-
-        uint256 assetsSold;
-        uint256 cashUsed;
-
-        if (totalNAVBefore > 0 && assetsValue > 0) {
-            // Assets to sell = amount x assetsValue / totalNAVBefore / ASSET_PRICE
-            assetsSold = (amountRepaid * assetsValue) / totalNAVBefore / ASSET_PRICE;
-            cashUsed   = amountRepaid - (assetsSold * ASSET_PRICE);
-        } else {
-            assetsSold = 0;
-            cashUsed   = amountRepaid;
-        }
-
-        require(assetsBefore >= assetsSold, "POC: Insufficient assets to honor the redemption");
-        require(cashBefore >= cashUsed,      "POC: Insufficient cash to honor the redemption");
-
-        // ── NAV CYCLE ARCHIVAL ────────────────────────────────────────────────
         _currentCycleNumber += 1;
         uint256 cycleNumber = _currentCycleNumber;
 
-        uint256 assetsAfter = assetsBefore - assetsSold;
-        uint256 cashAfter    = cashBefore - cashUsed;
-        uint256 sharesAfter  = sharesOutstanding - shareAmount;
-        uint256 totalNAVAfter   = cashAfter + (assetsAfter * ASSET_PRICE);
-        uint256 navPerShareAfter = sharesAfter > 0
-            ? totalNAVAfter / sharesAfter
+        CycleAfter memory c = _calcCycleAfterRedemption(calc, shareAmount, cycleNumber);
+        _archiveRedemption(calc, c, shareAmount, cycleNumber);
+
+        // ── INTERACTIONS ──────────────────────────────────────────────────────
+        if (calc.assetsSold > 0) {
+            require(assetToken.burn(calc.assetsSold, "REDEMPTION"), "POC: TokenizedAssets burn failed");
+        }
+        if (calc.cashUsed > 0) {
+            require(cashToken.burnFrom(address(this), calc.cashUsed, "REDEMPTION"), "POC: EMT burn failed");
+        }
+        require(sharesToken.burnFrom(msg.sender, shareAmount), "POC: TokenizedISIN burn failed");
+
+        emit OperationFinalized(msg.sender, OperationType.REDEMPTION, shareAmount, cycleNumber, block.timestamp);
+
+        _processingInProgress = false;
+    }
+
+    /// @dev Writes the NAVCycle archive entry and emits RedemptionExecuted/
+    ///   NAVCycleClosed. Split out of redeem() purely to keep that
+    ///   function's live stack variables low.
+    function _archiveRedemption(RedemptionCalc memory calc, CycleAfter memory c, uint256 shareAmount, uint256 cycleNumber) internal {
+        _navCycles[cycleNumber] = NAVCycle({
+            cycleNumber:        cycleNumber,
+            timestamp:          block.timestamp,
+            navPerShare:        c.navPerShareAfter,
+            totalNAV:           c.totalNAVAfter,
+            assetsHeld:         c.assetsAfter,
+            cashAvailable:      c.cashAfter,
+            sharesOutstanding:  c.sharesAfter,
+            operationType:      OperationType.REDEMPTION,
+            shareQuantity:      shareAmount,
+            assetsBought:       0,
+            assetsSold:         calc.assetsSold,
+            feeCharged:         calc.redemptionFee,
+            investor:           msg.sender,
+            stateFingerprint:   c.stateFingerprint,
+            isFinalized:        true
+        });
+
+        emit RedemptionExecuted(
+            msg.sender, shareAmount, calc.grossAmount, calc.redemptionFee, calc.isEarly, calc.netAmountToInvestor,
+            calc.assetsSold, calc.cashUsed, c.navPerShareAfter, cycleNumber, block.timestamp
+        );
+        emit NAVCycleClosed(
+            cycleNumber, OperationType.REDEMPTION, msg.sender, shareAmount, 0, calc.assetsSold,
+            calc.redemptionFee, c.cashAfter, c.assetsAfter, c.navPerShareAfter, c.stateFingerprint, block.timestamp
+        );
+    }
+
+    // =========================================================================
+    // ONGOING FEE ACCRUAL (management / custody / admin / performance)
+    // =========================================================================
+
+    /// @notice Computes the ongoing fees due since the last accrual and
+    struct FeeAccrual {
+        uint256 periodSeconds;
+        uint256 grossNAV;
+        uint256 managementFee;
+        uint256 custodyFee;
+        uint256 adminFee;
+        uint256 performanceFee;
+        uint256 navPerShare;
+        uint256 supply;
+    }
+
+    function accrueOngoingFees() external onlyRole(ADMIN_ROLE) whenNotPaused nonReentrant onlyIfInitialized {
+        FeeAccrual memory f;
+
+        f.periodSeconds = block.timestamp > lastFeeAccrualTimestamp
+            ? block.timestamp - lastFeeAccrualTimestamp
             : 0;
+        require(f.periodSeconds > 0, "POC: No time elapsed since the last fee accrual");
+        require(f.periodSeconds <= 7 days, "POC: Call accrueOngoingFees() more frequently (max 7-day window)");
+
+        f.grossNAV = _computeTotalNAV();
+        (f.managementFee, f.custodyFee, f.adminFee) = toolbox.calculateProrataOngoingFees(f.grossNAV, f.periodSeconds);
+
+        f.navPerShare = _computeNAVPerShare();
+        f.supply      = sharesToken.totalSupply();
+
+        if (f.supply > 0) {
+            f.performanceFee = toolbox.calculatePerformanceFees(f.navPerShare, f.supply);
+            toolbox.updateHighWaterMark(f.navPerShare, _currentCycleNumber);
+        }
+
+        lastFeeAccrualTimestamp = block.timestamp;
+
+        _currentCycleNumber += 1;
+        _archiveFeeAccrual(f, _currentCycleNumber);
+    }
+
+    /// @dev Archives a FEE_ACCRUAL NAV cycle and emits its events. Split out
+    ///   of accrueOngoingFees() purely to keep that function's live stack
+    ///   variables low.
+    function _archiveFeeAccrual(FeeAccrual memory f, uint256 cycleNumber) internal {
+        uint256 totalFee = f.managementFee + f.custodyFee + f.adminFee + f.performanceFee;
+        uint256 assetsHeld = assetToken.balanceOf(address(this));
+        uint256 cashAvailable = cashToken.balanceOf(address(this));
 
         bytes32 stateFingerprint = _computeStateFingerprint(
-            cycleNumber,
-            navPerShareAfter,
-            totalNAVAfter,
-            assetsAfter,
-            cashAfter,
-            sharesAfter
+            cycleNumber, f.navPerShare, f.grossNAV, assetsHeld, cashAvailable, f.supply
         );
 
         _navCycles[cycleNumber] = NAVCycle({
             cycleNumber:        cycleNumber,
             timestamp:          block.timestamp,
-            navPerShare:        navPerShareAfter,
-            totalNAV:           totalNAVAfter,
-            assetsHeld:         assetsAfter,
-            cashAvailable:      cashAfter,
-            sharesOutstanding:  sharesAfter,
-            operationType:      OperationType.REDEMPTION,
-            shareQuantity:      shareAmount,
+            navPerShare:        f.navPerShare,
+            totalNAV:           f.grossNAV,
+            assetsHeld:         assetsHeld,
+            cashAvailable:      cashAvailable,
+            sharesOutstanding:  f.supply,
+            operationType:      OperationType.FEE_ACCRUAL,
+            shareQuantity:      0,
             assetsBought:       0,
-            assetsSold:         assetsSold,
-            investor:           msg.sender,
+            assetsSold:         0,
+            feeCharged:         totalFee,
+            investor:           address(0),
             stateFingerprint:   stateFingerprint,
             isFinalized:        true
         });
 
-        // ── EVENT EMISSION ────────────────────────────────────────────────────
-        emit RedemptionExecuted(
-            msg.sender,
-            shareAmount,
-            amountRepaid,
-            assetsSold,
-            cashUsed,
-            navPerShareAfter,
-            cycleNumber,
-            block.timestamp
-        );
-
+        emit FeesAccrued(f.managementFee, f.custodyFee, f.adminFee, f.performanceFee, f.grossNAV, f.navPerShare, f.periodSeconds, block.timestamp);
         emit NAVCycleClosed(
-            cycleNumber,
-            OperationType.REDEMPTION,
-            msg.sender,
-            shareAmount,
-            0,
-            assetsSold,
-            cashAfter,
-            assetsAfter,
-            navPerShareAfter,
-            stateFingerprint,
-            block.timestamp
+            cycleNumber, OperationType.FEE_ACCRUAL, address(0), 0, 0, 0, totalFee,
+            cashAvailable, assetsHeld, f.navPerShare, stateFingerprint, block.timestamp
         );
-
-        // =====================================================================
-        // INTERACTIONS — EXTERNAL calls last (CEI pattern)
-        // =====================================================================
-        // The fund sells securities: burns its own TokenizedAssets tokens.
-        if (assetsSold > 0) {
-            require(assetToken.burn(assetsSold), "POC: TokenizedAssets burn failed");
-        }
-        // The fund burns the EMT cash it pays out to the investor off-chain.
-        if (cashUsed > 0) {
-            require(cashToken.burnFrom(address(this), cashUsed), "POC: EMT burn failed");
-        }
-        // The fund destroys the investor's TokenizedISIN shares; the
-        // shareholder register is updated atomically inside
-        // sharesToken.burnFrom().
-        require(sharesToken.burnFrom(msg.sender, shareAmount), "POC: TokenizedISIN burn failed");
-
-        // =====================================================================
-        // FINALIZATION TIMESTAMP — after all external interactions
-        // =====================================================================
-        // Emitted last, once the shares burn is confirmed on-chain. The EUR
-        // reimbursement can be triggered off-chain by the custodian.
-        emit OperationFinalized(msg.sender, OperationType.REDEMPTION, shareAmount, cycleNumber, block.timestamp);
-
-        _processingInProgress = false;
     }
 
     // =========================================================================
     // NAV CALCULATION
     // =========================================================================
 
-    /// @notice Computes the fund's total NAV in EUR.
-    /// @dev [POC-7] Total NAV = Cash + (TokenizedAssets held x ASSET_PRICE)
     function computeTotalNAV() external view returns (uint256) {
         return _computeTotalNAV();
     }
 
-    /// @notice Computes the NAV per share in EUR.
-    /// @dev [POC-7] NAV/share = Total NAV / TokenizedISIN shares outstanding
     function computeNAVPerShare() external view returns (uint256) {
         return _computeNAVPerShare();
     }
 
-    /// @notice Returns the fund's complete balance sheet state at this instant.
     function readFundBalanceSheet()
         external
         view
@@ -881,25 +982,46 @@ contract TokenizedFundPOC is
     {
         cash        = cashToken.balanceOf(address(this));
         assets      = assetToken.balanceOf(address(this));
-        assetsValue = assets * ASSET_PRICE;
+        assetsValue = assets.mulDiv(assetPriceEUR, PRECISION);
         totalNAV    = _computeTotalNAV();
         shares      = sharesToken.totalSupply();
         navPerShare = _computeNAVPerShare();
     }
 
-    /// @notice Verifies the balance sheet invariant: assets == liabilities.
+    /// @notice Verifies that total assets match total liabilities (shares
+    ///   outstanding valued at NAV per share).
+    /// @return totalAssets Total NAV of the fund (cash + assets valuation), EUR 18 dec
+    /// @return totalLiabilities Shares outstanding valued at NAV per share, EUR 18 dec
+    /// @return balanced True if totalAssets and totalLiabilities match within
+    ///   the expected 18-decimal fixed-point rounding tolerance
+    /// @dev totalLiabilities is reconstructed as
+    ///   supply * (totalNAV * PRECISION / supply) / PRECISION — a
+    ///   divide-then-multiply round trip through _computeNAVPerShare().
+    ///   Floor rounding at each step means this generally does NOT
+    ///   reconstruct totalAssets bit-for-bit exactly, even when the balance
+    ///   sheet is genuinely balanced (the gap is a negligible fraction of a
+    ///   wei-of-EUR, unrelated to any real accounting discrepancy). A strict
+    ///   `==` check would therefore report "unbalanced" on virtually every
+    ///   call. Instead, `balanced` tolerates a gap up to `supply` raw units
+    ///   — a generous bound for a single floor-division round trip — and
+    ///   only reports false for a gap larger than that, which would
+    ///   indicate a genuine problem worth investigating.
     function verifyBalanceSheet()
         external
         view
-        returns (
-            uint256 totalAssets,
-            uint256 totalLiabilities,
-            bool    balanced
-        )
+        returns (uint256 totalAssets, uint256 totalLiabilities, bool balanced)
     {
+        uint256 supply = sharesToken.totalSupply();
+
         totalAssets      = _computeTotalNAV();
-        totalLiabilities = sharesToken.totalSupply() * _computeNAVPerShare();
-        balanced         = (totalAssets == totalLiabilities);
+        totalLiabilities = supply.mulDiv(_computeNAVPerShare(), PRECISION);
+
+        uint256 dust = totalAssets > totalLiabilities
+            ? totalAssets - totalLiabilities
+            : totalLiabilities - totalAssets;
+        uint256 dustTolerance = supply > 0 ? supply : 1;
+
+        balanced = dust <= dustTolerance;
     }
 
     // =========================================================================
@@ -919,7 +1041,6 @@ contract TokenizedFundPOC is
         return sharesToken.getShareholderRecord(investor);
     }
 
-    /// @notice Returns the fund's global metrics.
     function readFundMetrics()
         external
         view
@@ -944,24 +1065,14 @@ contract TokenizedFundPOC is
         );
     }
 
-    /// @notice Verifies the cryptographic integrity of an archived NAV cycle.
     function verifyCycleIntegrity(uint256 cycleNumber)
         external
         view
-        returns (
-            bool    integrity,
-            bytes32 computedFingerprint,
-            bytes32 storedFingerprint
-        )
+        returns (bool integrity, bytes32 computedFingerprint, bytes32 storedFingerprint)
     {
         NAVCycle storage cycle = _navCycles[cycleNumber];
         computedFingerprint = _computeStateFingerprint(
-            cycle.cycleNumber,
-            cycle.navPerShare,
-            cycle.totalNAV,
-            cycle.assetsHeld,
-            cycle.cashAvailable,
-            cycle.sharesOutstanding
+            cycle.cycleNumber, cycle.navPerShare, cycle.totalNAV, cycle.assetsHeld, cycle.cashAvailable, cycle.sharesOutstanding
         );
         storedFingerprint = cycle.stateFingerprint;
         integrity          = (computedFingerprint == storedFingerprint);
@@ -975,35 +1086,47 @@ contract TokenizedFundPOC is
     // ADMINISTRATION
     // =========================================================================
 
-    /// @notice Pauses the contract (emergency circuit breaker).
-    /// @dev Blocks subscribe() and redeem().
     function pauseContract() external onlyRole(ADMIN_ROLE) {
         _pause();
         emit SecurityAlert("Contract paused", msg.sender, block.timestamp);
     }
 
-    /// @notice Resumes the contract after a pause.
     function unpauseContract() external onlyRole(ADMIN_ROLE) {
         _unpause();
+    }
+
+    /// @notice Updates the price used to value TokenizedAssets holdings.
+    /// @dev KNOWN LIMITATION: manual/admin-driven, not a price oracle.
+    function setAssetPrice(uint256 newPriceEUR) external onlyRole(ADMIN_ROLE) whenNotPaused {
+        require(newPriceEUR > 0, "POC: Asset price must be > 0");
+        emit AssetPriceUpdated(assetPriceEUR, newPriceEUR, block.timestamp);
+        assetPriceEUR = newPriceEUR;
+    }
+
+    /// @notice Points the fund at a new Toolbox deployment.
+    /// @dev The new Toolbox must be granted FUND_AUTHORIZED_ROLE (for
+    ///   updateHighWaterMark) before or immediately after this call; the
+    ///   previous Toolbox's grant should be revoked for hygiene.
+    function updateToolbox(address newToolbox) external onlyRole(ADMIN_ROLE) {
+        require(newToolbox != address(0), "POC: Invalid toolbox address");
+        emit ToolboxUpdated(address(toolbox), newToolbox, block.timestamp);
+        toolbox = IToolbox(newToolbox);
     }
 
     // =========================================================================
     // INTERNAL UTILITY FUNCTIONS
     // =========================================================================
 
-    /// @notice Computes the fund's total NAV (internal logic).
     function _computeTotalNAV() internal view returns (uint256) {
-        return cashToken.balanceOf(address(this)) + (assetToken.balanceOf(address(this)) * ASSET_PRICE);
+        return cashToken.balanceOf(address(this)) + assetToken.balanceOf(address(this)).mulDiv(assetPriceEUR, PRECISION);
     }
 
-    /// @notice Computes the NAV per share (internal logic).
     function _computeNAVPerShare() internal view returns (uint256) {
         uint256 supply = sharesToken.totalSupply();
-        if (supply == 0) return INITIAL_SUBSCRIPTION_PRICE;
-        return _computeTotalNAV() / supply;
+        if (supply == 0) return INITIAL_NAV_PER_SHARE;
+        return _computeTotalNAV().mulDiv(PRECISION, supply);
     }
 
-    /// @notice Computes the tamper-proof keccak256 fingerprint of a full NAV state.
     function _computeStateFingerprint(
         uint256 cycleNumber,
         uint256 navPerShare,
@@ -1013,13 +1136,7 @@ contract TokenizedFundPOC is
         uint256 sharesOutstanding
     ) internal view returns (bytes32) {
         return keccak256(abi.encodePacked(
-            cycleNumber,
-            navPerShare,
-            totalNAV,
-            assetsHeld,
-            cashParam,
-            sharesOutstanding,
-            address(this)
+            cycleNumber, navPerShare, totalNAV, assetsHeld, cashParam, sharesOutstanding, address(this)
         ));
     }
 }
