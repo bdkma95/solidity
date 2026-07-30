@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT 
 pragma solidity 0.8.27;
 //
 //  Smart Contract TOOLBOX — v2.0.0 (Phase 2)
