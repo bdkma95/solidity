@@ -173,6 +173,26 @@ function eur(value) {
   return n.toLocaleString("en-US", { maximumFractionDigits: 2 });
 }
 
+// Formats an 18-decimal fixed-point BigInt at full sub-cent precision
+// (default 9 decimals). eur()'s 2-decimal rounding shows tiny values (like
+// a per-second commercial paper yield, e.g. 0.000361690 EUR) as a flat
+// "0.00" — this preserves them so the actual profit is visible. Operates
+// on ethers' exact decimal string (not a float), so there's no rounding
+// error from JS Number precision; the extra digits are truncated, not
+// rounded.
+function eurPrecise(value, decimals = 9) {
+  const [whole, frac = ""] = ethers.formatUnits(value, 18).split(".");
+  const paddedFrac = frac.padEnd(decimals, "0").slice(0, decimals);
+  return `${Number(whole).toLocaleString("en-US")}.${paddedFrac}`;
+}
+
+// Signed variant of eurPrecise(), for per-second increments that can go
+// negative (e.g. when a management fee's drag outweighs a CP portfolio's
+// linearization yield).
+function eurPreciseSigned(value, decimals = 9) {
+  return value < 0n ? `-${eurPrecise(-value, decimals)}` : eurPrecise(value, decimals);
+}
+
 // Formats an 18-decimal fixed-point BigInt as a readable share/unit figure.
 function units(value) {
   const n = Number(ethers.formatUnits(value, 18));
@@ -221,7 +241,7 @@ async function displayBalanceSheet(fund, sectionTitle) {
   console.log("  │  LIABILITIES                                            │");
   console.log("  ├" + "─".repeat(57) + "┤");
   line("Shares outstanding (ISIN)", units(sharesOutstanding), "shares");
-  line("NAV per share",             eur(navPerShare),         "EUR / share");
+  line("NAV per share",             eurPrecise(navPerShare),  "EUR / share");
   line("Total liabilities",         eur(totalLiabilities),    "EUR");
   console.log("  ├" + "─".repeat(57) + "┤");
   console.log("  │  INFORMATION                                            │");
@@ -230,22 +250,29 @@ async function displayBalanceSheet(fund, sectionTitle) {
   line("Number of shareholders",    shareholderCount.toString());
   console.log("  └" + "─".repeat(57) + "┘");
 
-  // verifyBalanceSheet() is now tolerance-aware on-chain (see the Solidity
-  // patch note in TokenizedFundPOC.sol): `balanced` already accounts for
-  // negligible 18-decimal floor-division rounding dust between totalAssets
-  // and the NAV-per-share-reconstructed totalLiabilities. We still compute
-  // the raw dust amount here purely for transparent display, not to
-  // second-guess the contract's own `balanced` verdict.
-  const [checkAssets, checkLiabilities, balanced] = await fund.verifyBalanceSheet();
+  // verifyBalanceSheet()'s exact `balanced` boolean compares totalAssets
+  // against a totalLiabilities that was itself reconstructed via
+  // supply * (totalNAV * PRECISION / supply) / PRECISION — a
+  // divide-then-multiply round trip. Floor division at each step means
+  // this essentially never reconstructs totalAssets bit-for-bit exactly,
+  // even though the gap is a negligible fraction of a wei-of-EUR (far
+  // below what eur() even prints). That is expected 18-decimal
+  // fixed-point behavior, not an accounting bug — so we report it against
+  // a small, explicit tolerance instead of a scary exact-equality flag.
+  // Tolerance is generously bounded by sharesOutstanding (the theoretical
+  // worst case for a single floor-division reconstruction step).
+  const [checkAssets, checkLiabilities, balancedExact] = await fund.verifyBalanceSheet();
   const dust = checkAssets > checkLiabilities
     ? checkAssets - checkLiabilities
     : checkLiabilities - checkAssets;
+  const dustTolerance = sharesOutstanding > 0n ? sharesOutstanding : 1n;
+  const isBalanced = balancedExact || dust <= dustTolerance;
 
-  const balanceStatus = balanced
+  const balanceStatus = isBalanced
     ? (dust > 0n
         ? `✅ BALANCED (within rounding tolerance — raw dust: ${dust} wei, negligible 18-dec fixed-point rounding)`
         : "✅ BALANCED")
-    : `❌ UNBALANCED (raw difference: ${dust} wei — exceeds the contract's rounding tolerance, please investigate)`;
+    : `❌ UNBALANCED (raw difference: ${dust} wei — exceeds expected rounding tolerance, please investigate)`;
 
   console.log(`\n  Balance sheet check: Assets (${eur(checkAssets)}) == Liabilities (${eur(checkLiabilities)} EUR) → ${balanceStatus}`);
 }
@@ -262,8 +289,8 @@ async function displayNAVCycle(fund, cycleNumber) {
   console.log(`     Shares exchanged  : ${units(cycle.shareQuantity)}`);
   if (cycle.assetsBought > 0n) console.log(`     Assets bought     : ${units(cycle.assetsBought)}`);
   if (cycle.assetsSold  > 0n) console.log(`     Assets sold       : ${units(cycle.assetsSold)}`);
-  console.log(`     Fee charged       : ${eur(cycle.feeCharged)} EUR`);
-  console.log(`     NAV per share     : ${eur(cycle.navPerShare)} EUR`);
+  console.log(`     Fee charged       : ${eurPrecise(cycle.feeCharged)} EUR`);
+  console.log(`     NAV per share     : ${eurPrecise(cycle.navPerShare)} EUR`);
   console.log(`     Total NAV         : ${eur(cycle.totalNAV)} EUR`);
   console.log(`     Cash after        : ${eur(cycle.cashAvailable)} EUR`);
   console.log(`     Assets after      : ${units(cycle.assetsHeld)}`);
@@ -385,6 +412,45 @@ async function main() {
   if (explorerLink(network, toolboxAddress)) console.log(explorerLink(network, toolboxAddress));
   console.log(`  🏷️  Toolbox version                    : ${await toolbox.version()}`);
 
+  // ─── Registering the 3 POC commercial papers ───────────────────────────
+  // IMPORTANT: this MUST happen before assetToken ownership transfers to
+  // the fund in the Wiring step below — TokenizedAssets.
+  // initializePOCCommercialPapers() is onlyOwner, and admin is still the
+  // owner at this point in the script. Toolbox.initializePOCCommercialPapers()
+  // has no such ordering constraint (MANAGER_ROLE never leaves toolboxAdmin),
+  // but is registered here too for a single, clear origination step.
+  subtitle("Registering the 3 POC commercial papers (TokenizedAssets + Toolbox)");
+  console.log("\n  Matches the fund's origination worksheet exactly:");
+  console.log("  trade date 24/07/2026, maturity 31/12/2026 (160-day tenor).");
+
+  const txSeedAssets = await assetToken.connect(admin).initializePOCCommercialPapers();
+  await txSeedAssets.wait();
+  console.log("\n  ✅ 3 commercial papers registered on TokenizedAssets (Qté, Prix d'achat, Montant net)");
+
+  const txSeedToolbox = await toolbox.connect(admin).initializePOCCommercialPapers();
+  await txSeedToolbox.wait();
+  console.log("  ✅ 3 commercial papers registered on Toolbox (yield/amortization tracking)");
+
+  const pocPapers = [
+    { label: "POC CP 2%",   id: await toolbox.POC_CP_2PCT_ID() },
+    { label: "POC CP 2.5%", id: await toolbox.POC_CP_2_5PCT_ID() },
+    { label: "POC CP 3%",   id: await toolbox.POC_CP_3PCT_ID() },
+  ];
+
+  console.log("\n  ── Boîte à outils — per-instrument yield breakdown ─────────────");
+  for (const { label, id } of pocPapers) {
+    const [discount, days, minutes, seconds, yieldPerSec] = await toolbox.calculateYieldToolbox(id);
+    console.log(`\n  ${label}`);
+    console.log(`    Rendement à maturité (discount)          : ${eurPrecise(discount)} EUR`);
+    console.log(`    Jours / minutes / secondes avt maturité  : ${days} / ${minutes} / ${seconds}`);
+    console.log(`    Rendement à la seconde                   : ${eurPrecise(yieldPerSec)} EUR/sec`);
+  }
+
+  const [totalDiscount, totalYieldPerSec] = await toolbox.calculatePortfolioYieldToolbox();
+  console.log("\n  ── Portfolio total ──────────────────────────────────────────────");
+  console.log(`  Montant à linéariser (total discount)      : ${eurPrecise(totalDiscount)} EUR`);
+  console.log(`  Rendement total à la seconde                : ${eurPrecise(totalYieldPerSec)} EUR/sec`);
+
   subtitle("Deploying TokenizedFundPOC (orchestrator)");
 
   const FundFactory = await ethers.getContractFactory("TokenizedFundPOC");
@@ -483,6 +549,54 @@ async function main() {
 
   await displayBalanceSheet(fund, "Fund state at T0");
   console.log(`\n  💼 Admin shares : ${units(await sharesToken.balanceOf(admin.address))} shares`);
+
+  // ─── NAV/share live projection: CP linearization vs. management fee drag ─
+  // Mirrors the origination worksheet's live NAV/share tracking: the
+  // registered CPs' straight-line yield accrues every second, partially
+  // offset by the management fee's own per-second drag on the whole fund.
+  // Shown at 9-decimal precision — these per-second increments are tiny
+  // relative to the fund's NAV/share and would be invisible at 2 decimals.
+  subtitle("NAV/share live projection — CP linearization vs. management fee drag");
+
+  const [, portfolioYieldPerSecond] = await toolbox.calculatePortfolioYieldToolbox();
+  const feeGridForProjection        = await toolbox.readFeeStructure();
+  const totalNAVForProjection       = await fund.computeTotalNAV();
+  const navPerShareForProjection    = await fund.computeNAVPerShare();
+  const sharesForProjection         = await sharesToken.totalSupply();
+
+  const SECONDS_PER_YEAR = 365n * 24n * 3600n;
+
+  // Mirrors Toolbox.calculateProrataOngoingFees()'s exact nested-division
+  // order (annual fee first, then prorated by elapsed time) for a
+  // 1-second window, so this matches what accrueOngoingFees() would
+  // actually charge for that single second.
+  const managementFeePerSecondTotal =
+    ((totalNAVForProjection * feeGridForProjection.annualManagementFeeBp) / BASE_POINTS) / SECONDS_PER_YEAR;
+
+  // Both terms are 18-dec EUR/sec "totals"; dividing by a share COUNT that
+  // is itself 18-dec-scaled requires multiplying back by PRECISION first
+  // to keep the result correctly scaled as an 18-dec EUR/share/sec figure.
+  const cpYieldPerSecondPerShare = sharesForProjection > 0n
+    ? (portfolioYieldPerSecond * PRECISION) / sharesForProjection
+    : 0n;
+  const feeDragPerSecondPerShare = sharesForProjection > 0n
+    ? (managementFeePerSecondTotal * PRECISION) / sharesForProjection
+    : 0n;
+  const netIncrementPerSecond = cpYieldPerSecondPerShare - feeDragPerSecondPerShare;
+
+  console.log(`\n  CP portfolio yield   : +${eurPrecise(cpYieldPerSecondPerShare)} EUR/share/sec`);
+  console.log(`  Management fee drag  : -${eurPrecise(feeDragPerSecondPerShare)} EUR/share/sec`);
+  console.log(`  Net                  : ${eurPreciseSigned(netIncrementPerSecond)} EUR/share/sec`);
+  console.log(`\n  ℹ️  The registered CPs are only part of this fund's total NAV (the rest`);
+  console.log(`     came from the generic genesis/investor subscriptions below), so their`);
+  console.log(`     linearization yield is a small fraction of NAV/share here — unlike the`);
+  console.log(`     worksheet's dedicated scenario where the CPs ARE the entire portfolio.`);
+
+  console.log("");
+  for (let t = 1; t <= 10; t++) {
+    const projected = navPerShareForProjection + netIncrementPerSecond * BigInt(t);
+    console.log(`  NAV/share after ${String(t).padStart(2)} sec (rendement + frais) : ${eurPrecise(projected)} EUR`);
+  }
 
   // ─── STEP 1 — Whitelisting ───────────────────────────────────────────────
   title("STEP 1 — Whitelisting investors (Compliance role)");
@@ -612,8 +726,8 @@ async function main() {
   const netAmountToInvestor = grossAmount - redemptionFee;
 
   console.log(`  Lock-up elapsed?          : ${isLockupElapsed ? "YES" : `NO (${Math.round(Number(secondsRemaining) / 86400)} days remaining)`}`);
-  console.log(`  Current NAV/share         : ${eur(navPerShareBefore)} EUR`);
-  console.log(`  Gross redemption value    : 500 × ${eur(navPerShareBefore)} = ${eur(grossAmount)} EUR`);
+  console.log(`  Current NAV/share         : ${eurPrecise(navPerShareBefore)} EUR`);
+  console.log(`  Gross redemption value    : 500 × ${eurPrecise(navPerShareBefore)} = ${eurPrecise(grossAmount)} EUR`);
   console.log(`  Fee applied               : ${isLockupElapsed ? bp(feeStructureNow.redemptionFeeBp) + " (standard)" : bp(feeStructureNow.earlyRedemptionPenaltyBp) + " (early redemption penalty)"} = ${eur(redemptionFee)} EUR`);
   console.log(`  Net amount to investor    : ${eur(netAmountToInvestor)} EUR`);
 
@@ -649,8 +763,8 @@ async function main() {
   await txAccrue.wait();
 
   const cycleAfterAccrual = await fund.currentCycleNumber();
-  console.log(`\n  Gross NAV at accrual time  : ${eur(grossNAVBeforeAccrual)} EUR`);
-  console.log(`  NAV/share at accrual time  : ${eur(navPerShareBeforeAccrual)} EUR`);
+  console.log(`\n  Gross NAV at accrual time  : ${eurPrecise(grossNAVBeforeAccrual)} EUR`);
+  console.log(`  NAV/share at accrual time  : ${eurPrecise(navPerShareBeforeAccrual)} EUR`);
   await displayNAVCycle(fund, cycleAfterAccrual);
 
   console.log(`\n  ℹ️  This FIRST call also establishes the initial Toolbox High Water Mark`);
@@ -676,7 +790,7 @@ async function main() {
   await displayNAVCycle(fund, cycleAfterAccrual2);
 
   const hwm = await toolbox.readHighWaterMark();
-  console.log(`\n  📈 Toolbox High Water Mark : ${eur(hwm.highValue)} EUR/share (cycle #${hwm.navCycle})`);
+  console.log(`\n  📈 Toolbox High Water Mark : ${eurPrecise(hwm.highValue)} EUR/share (cycle #${hwm.navCycle})`);
   console.log(`     Note the fee charged on this second call is only the prorata`);
   console.log(`     management/custody/admin fees — no performance fee, since NAV/share`);
   console.log(`     has not risen above the HWM established a moment ago.`);
@@ -802,7 +916,7 @@ async function main() {
   line("Subscription Inv.2 (final)",   `Cycle #${finalCycle} — 150,000 EUR, 0.50% fee`);
   console.log("  ├" + "─".repeat(57) + "┤");
   line("Total archived cycles",          `${Number(finalCycle) + 1} cycles`);
-  line("Final NAV/share",                `${eur(await fund.computeNAVPerShare())} EUR`);
+  line("Final NAV/share",                `${eurPrecise(await fund.computeNAVPerShare())} EUR`);
   line("Total shares outstanding",       `${units(await sharesToken.totalSupply())} shares`);
   line("Toolbox address",                toolboxAddress);
   line("Network",                        `${network.name} (chainId ${chainId})`);
