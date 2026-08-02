@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT 
+// SPDX-License-Identifier: MIT
 pragma solidity 0.8.27;
 //
 //  Smart Contract TOOLBOX — v2.0.0 (Phase 2)
@@ -1282,14 +1282,27 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
         // Term 2 (quadratic): r^2 x t x (t-1) / (2 x 365^2)
         // Compounding correction: represents the "gain on the gain"
         // Significant for t > 180d or r > 5%
+        //
+        // BUGFIX: r2 must be computed at PRECISION (1e18) fixed-point scale.
+        // annualRateBp/BASE_POINTS is a fraction (e.g. 500/10000 = 0.05); its
+        // square (0.0025) cannot be represented as a raw, unscaled integer —
+        // mulDiv(rateBp, rateBp, BASE_POINTS*BASE_POINTS) previously computed
+        // exactly that, which truncates to 0 for every annualRateBp below
+        // 10,000 (i.e. below 100%/yr), silently disabling this term for any
+        // realistic rate and making calculateCompoundInterest() return
+        // identical results to calculateSimpleInterest(). Fixed by scaling
+        // the rate to PRECISION before squaring, matching the fixed-point
+        // convention used everywhere else in this contract.
         uint256 term2 = 0;
         if (numberOfDays > 1) {
-            // r^2 x t(t-1) / (2 x 365^2)
-            // Computed in several steps to avoid overflow
-            uint256 r2 = Math.mulDiv(annualRateBp, annualRateBp, BASE_POINTS * BASE_POINTS);
+            // r, scaled to PRECISION: rScaled = rateBp x PRECISION / BASE_POINTS
+            uint256 rScaled = Math.mulDiv(annualRateBp, PRECISION, BASE_POINTS);
+            // r^2, still PRECISION-scaled: r2Scaled = rScaled^2 / PRECISION
+            uint256 r2Scaled = Math.mulDiv(rScaled, rScaled, PRECISION);
+            // term2 = principal x r2Scaled x t(t-1) / (2 x 365^2 x PRECISION)
             term2 = Math.mulDiv(
-                Math.mulDiv(principal * r2, numberOfDays * (numberOfDays - 1), PRECISION),
-                PRECISION,
+                Math.mulDiv(principal, r2Scaled, PRECISION),
+                numberOfDays * (numberOfDays - 1),
                 2 * DAYS_PER_YEAR * DAYS_PER_YEAR
             );
         }
@@ -1543,17 +1556,85 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
         // No INTERACTIONS: no external call in this function
     }
 
+    /// @notice Computes the discount-to-maturity for a discount instrument
+    ///   directly from its face value/quantity and purchase price — no
+    ///   separately-supplied acquisition price needed.
+    /// @param quantity Face value / nominal quantity, EUR (18 dec) — "Qté"
+    /// @param purchasePriceRatio Price paid, as a fraction of par
+    ///   (PRECISION = 100%, e.g. 0.98125e18 for 98.125%) — "Prix d'achat"
+    /// @return discount quantity - (quantity x purchasePriceRatio / PRECISION)
+    ///   — the worksheet's "Rendement à maturité" column. Literally "the
+    ///   difference between 100% and the purchase price, times the
+    ///   quantity."
+    /// @dev Uses a PRECISION-scaled ratio (not basis points): a price like
+    ///   98.125% is 9,812.5 bp — not representable at whole-bp granularity
+    ///   — but is exact at 18-decimal PRECISION (0.98125e18).
+    function calculateDiscountFromPrice(uint256 quantity, uint256 purchasePriceRatio)
+        public
+        pure
+        returns (uint256 discount)
+    {
+        require(quantity > 0, "TOOLBOX: Zero quantity");
+        require(purchasePriceRatio > 0 && purchasePriceRatio <= PRECISION, "TOOLBOX: Invalid purchase price ratio");
+
+        uint256 netAmountPaid = Math.mulDiv(quantity, purchasePriceRatio, PRECISION);
+        discount = quantity - netAmountPaid;
+    }
+
+    /// @notice Computes the constant per-second straight-line yield rate for
+    ///   a discount instrument directly from its quantity, purchase price,
+    ///   and tenor — no on-chain registration required. Same "boite a
+    ///   outils" math as calculateYieldToolbox() below, but callable for
+    ///   any hypothetical instrument, not just an already-registered one.
+    /// @param quantity Face value, EUR (18 dec)
+    /// @param purchasePriceRatio Price paid, as a fraction of par (PRECISION = 100%)
+    /// @param durationDays Full tenor in days (issuance -> maturity)
+    /// @return yieldPerSecond discount / (durationDays x 1 days), EUR/sec (18 dec)
+    ///   — the worksheet's "rendement à la seconde" column.
+    function calculateYieldPerSecondFromPrice(
+        uint256 quantity,
+        uint256 purchasePriceRatio,
+        uint256 durationDays
+    ) external pure returns (uint256 yieldPerSecond) {
+        require(durationDays > 0, "TOOLBOX: Zero duration");
+        uint256 discount = calculateDiscountFromPrice(quantity, purchasePriceRatio);
+        yieldPerSecond = discount / (durationDays * 1 days);
+    }
+
+    /// @dev Shared implementation for initializePOCCommercialPapers():
+    ///   derives acquisitionPrice from quantity + purchasePriceRatio via
+    ///   calculateDiscountFromPrice() instead of taking it as a separately
+    ///   hardcoded literal — the 5,000 / 7,500 / 37,500 EUR discounts (and
+    ///   the 495,000 / 492,500 / 1,962,500 EUR acquisition prices behind
+    ///   them) are now computed ON-CHAIN, not pre-computed off-chain and
+    ///   hardcoded as magic numbers.
+    function _registerPOCPaperFromPrice(
+        bytes32 identifier,
+        uint256 quantity,
+        uint256 purchasePriceRatio,
+        uint256 yieldRateBp,
+        uint256 issuanceDate,
+        uint256 maturityDate
+    ) internal {
+        uint256 discount = calculateDiscountFromPrice(quantity, purchasePriceRatio);
+        uint256 acquisitionPrice = quantity - discount;
+        _registerCommercialPaper(identifier, quantity, acquisitionPrice, yieldRateBp, issuanceDate, maturityDate);
+    }
+
     /// @notice One-time POC seeding: registers the three demo commercial
     ///   papers from the fund's origination worksheet — POC CP 2%, POC CP
-    ///   2.5%, and POC CP 3% — using the exact figures from that worksheet.
-    ///   Safe to call once; reverts on any subsequent call.
+    ///   2.5%, and POC CP 3%. Safe to call once; reverts on any subsequent
+    ///   call.
     /// @dev Trade date 24/07/2026 00:00:00 UTC (1784851200), maturity
     ///   31/12/2026 00:00:00 UTC (1798675200) — a 160-day tenor for all
     ///   three instruments, matching the worksheet's "nbre de jours avt
-    ///   maturité" column exactly. Discount (faceValue - acquisitionPrice)
-    ///   per paper: 5,000 / 7,500 / 37,500 EUR, matching the worksheet's
-    ///   "Rendement à maturité" column and its 50,000 EUR total
-    ///   ("Montant à linéariser").
+    ///   maturité" column exactly. Each paper's acquisition price (and
+    ///   therefore its discount — the worksheet's "Rendement à maturité"
+    ///   column: 5,000 / 7,500 / 37,500 EUR, 50,000 EUR total /
+    ///   "Montant à linéariser") is derived on-chain by
+    ///   _registerPOCPaperFromPrice() from just the quantity and purchase
+    ///   price below — only the worksheet's "Qté" and "Prix d'achat"
+    ///   columns are hardcoded here; "Montant net" is not.
     function initializePOCCommercialPapers() external onlyRole(MANAGER_ROLE) whenNotPaused nonReentrant {
         require(!pocCommercialPapersInitialized, "TOOLBOX: POC commercial papers already initialized");
         pocCommercialPapersInitialized = true;
@@ -1561,32 +1642,32 @@ contract Toolbox is IToolbox, AccessControl, Pausable, ReentrancyGuard {
         uint256 tradeDate    = 1784851200; // 24/07/2026 00:00:00 UTC
         uint256 maturityDate = 1798675200; // 31/12/2026 00:00:00 UTC
 
-        // POC CP 2%  — 500,000 EUR face value, bought at 99.000% of par
-        _registerCommercialPaper(
+        // POC CP 2%   — 500,000 EUR face value, bought at 99.000% of par
+        _registerPOCPaperFromPrice(
             POC_CP_2PCT_ID,
-            500_000 * PRECISION,   // faceValue
-            495_000 * PRECISION,   // acquisitionPrice (99.000% x 500,000)
-            200,                    // yieldRateBp = 2.00%
+            500_000 * PRECISION,       // quantity ("Qté")
+            99 * PRECISION / 100,      // purchasePriceRatio = 99.000% of par
+            200,                        // yieldRateBp = 2.00%
             tradeDate,
             maturityDate
         );
 
         // POC CP 2.5% — 500,000 EUR face value, bought at 98.500% of par
-        _registerCommercialPaper(
+        _registerPOCPaperFromPrice(
             POC_CP_2_5PCT_ID,
-            500_000 * PRECISION,   // faceValue
-            492_500 * PRECISION,   // acquisitionPrice (98.500% x 500,000)
-            250,                    // yieldRateBp = 2.50%
+            500_000 * PRECISION,
+            985 * PRECISION / 1000,    // purchasePriceRatio = 98.500% of par
+            250,                        // yieldRateBp = 2.50%
             tradeDate,
             maturityDate
         );
 
-        // POC CP 3%  — 2,000,000 EUR face value, bought at 98.125% of par
-        _registerCommercialPaper(
+        // POC CP 3%   — 2,000,000 EUR face value, bought at 98.125% of par
+        _registerPOCPaperFromPrice(
             POC_CP_3PCT_ID,
-            2_000_000 * PRECISION,   // faceValue
-            1_962_500 * PRECISION,   // acquisitionPrice (98.125% x 2,000,000)
-            300,                      // yieldRateBp = 3.00%
+            2_000_000 * PRECISION,
+            98125 * PRECISION / 100000, // purchasePriceRatio = 98.125% of par
+            300,                          // yieldRateBp = 3.00%
             tradeDate,
             maturityDate
         );
